@@ -1,4 +1,5 @@
 import express from "express";
+import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import {
   acceptSignedEvent,
@@ -26,10 +27,19 @@ export function createApp(configuration = process.env, options = {}) {
   const runtimeCatalog = validateSimulatorConfiguration(configuration);
   const app = express();
   const projectRoot = resolve(options.projectRoot ?? process.cwd());
-  const storePath = resolve(projectRoot, configuration.PROJECT_PAYMENT_STORE_PATH ?? ".data/project-payments.sqlite");
+  const simulatorRuntime = isSimulatorRuntime(configuration);
+  const storePath = resolveEvidenceScopedStorePath(
+    resolve(projectRoot, configuration.PROJECT_PAYMENT_STORE_PATH ?? ".data/project-payments.sqlite"),
+    simulatorRuntime
+      ? {
+          environmentId: configuration.VIBENEST_PROJECT_PAYMENTS_ENVIRONMENT_ID,
+          manifestDigest: configuration.VIBENEST_PROJECT_PAYMENTS_MANIFEST_DIGEST,
+          builtCommit: resolveBuiltCommit(configuration)
+        }
+      : null
+  );
   const store = new DurableProjectPaymentStore(storePath);
   const provider = createProjectPaymentProvider(configuration);
-  const simulatorRuntime = isSimulatorRuntime(configuration);
   const verifierRuntime = simulatorRuntime
     && configuration.VIBENEST_PROJECT_PAYMENTS_VERIFIER_ENABLED === "true";
   const webhookRateLimiter = createWebhookRateLimiter({
@@ -252,6 +262,23 @@ export function createApp(configuration = process.env, options = {}) {
   });
 
   return app;
+}
+
+export function resolveEvidenceScopedStorePath(basePath, runtimeIdentity) {
+  const resolvedBase = resolve(basePath);
+  if (runtimeIdentity === null) return resolvedBase;
+  const environmentId = runtimeIdentity?.environmentId ?? "";
+  const manifestDigest = runtimeIdentity?.manifestDigest ?? "";
+  const builtCommit = runtimeIdentity?.builtCommit ?? "";
+  const scope = createHash("sha256")
+    .update("vibenest-project-payments-evidence-v1\0", "utf8")
+    .update(environmentId, "utf8")
+    .update("\0", "utf8")
+    .update(manifestDigest, "ascii")
+    .update("\0", "utf8")
+    .update(builtCommit, "ascii")
+    .digest("hex");
+  return `${resolvedBase}.${scope}`;
 }
 
 // Disposable simulator auth shim: the hosting QA boundary injects this header. All

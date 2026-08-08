@@ -31,7 +31,7 @@
   "localChecks": {
     "node": { "status": "PASS", "version": "v26.4.0", "declaredMinimum": "22.13", "minimumRuntimeTested": "v22.13.1" },
     "npmCi": { "status": "PASS", "packagesAdded": 67, "packagesAudited": 68, "vulnerabilities": 0 },
-    "tests": { "status": "PASS", "passed": 21, "failed": 0 },
+    "tests": { "status": "PASS", "passed": 23, "failed": 0 },
     "build": { "status": "PASS" },
     "npmAudit": { "status": "PASS", "vulnerabilities": 0 },
     "credentialSecretScan": { "status": "PASS", "scannedFiles": 16, "findings": 0 }
@@ -45,8 +45,9 @@
     "one-time and recurring source isolation through cancellation and refunds in both purchase orders",
     "renewal advances the signed period exactly once and scheduled cancellation retains its signed end",
     "server-side buyer isolation for checkout, portal, entitlement, and protected exports",
+    "symmetric subscription identity fencing and terminal no-reactivation after cancellation",
     "bounded webhook rate limiting and simulator-only secret-protected evidence harness",
-    "GET-only verifier challenge logic using SOURCE_COMMIT and canonical manifest digest",
+    "GET-only verifier challenge logic with durable evidence partitioned by environment, canonical manifest digest, and exact SOURCE_COMMIT",
     "disabled mode exposes neither webhook, harness, nor verifier",
     "seller-owned versioned Draft/noindex legal routes"
   ],

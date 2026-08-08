@@ -311,6 +311,62 @@ test("one-time and recurring sources remain isolated through refunds in both pur
   assert.equal((await fixture.store.getEntitlement(secondBuyer)).active, false);
 });
 
+test("subscription identity is symmetric and a terminal source cannot be reactivated", async context => {
+  const base = Date.now() - 20_000;
+  const periodStart = at(base, 0);
+  const subscriptionId = providerId("sim_sub", 61);
+
+  const transactionFirst = await temporaryStore(context);
+  await deliver(transactionFirst.store, transactionEvent({
+    eventNumber: 61,
+    transactionNumber: 61,
+    occurredAt: at(base, 1),
+    subscriptionId,
+    subjectKey: "qa-identity-a",
+    periodStartsAt: periodStart
+  }));
+  assert.equal((await transactionFirst.store.processDue()).failed, 0);
+  await deliver(transactionFirst.store, subscriptionEvent({
+    eventNumber: 62,
+    subscriptionNumber: 61,
+    eventType: "subscription.created",
+    occurredAt: at(base, 2),
+    subjectKey: "qa-identity-b",
+    periodStartsAt: periodStart
+  }));
+  assert.equal((await transactionFirst.store.processDue()).failed, 1);
+  assert.equal((await transactionFirst.store.getEntitlement("qa-identity-b")).active, false);
+
+  const terminal = await temporaryStore(context);
+  await deliver(terminal.store, subscriptionEvent({
+    eventNumber: 63,
+    subscriptionNumber: 61,
+    eventType: "subscription.created",
+    occurredAt: at(base, 3),
+    subjectKey: "qa-terminal",
+    periodStartsAt: periodStart
+  }));
+  await deliver(terminal.store, subscriptionEvent({
+    eventNumber: 64,
+    subscriptionNumber: 61,
+    eventType: "subscription.canceled",
+    occurredAt: at(base, 4),
+    subjectKey: "qa-terminal",
+    periodStartsAt: periodStart
+  }));
+  assert.equal((await terminal.store.processDue()).failed, 0);
+  await deliver(terminal.store, transactionEvent({
+    eventNumber: 65,
+    transactionNumber: 65,
+    occurredAt: at(base, 5),
+    subscriptionId,
+    subjectKey: "qa-terminal",
+    periodStartsAt: periodStart
+  }));
+  assert.equal((await terminal.store.processDue()).failed, 1);
+  assert.equal((await terminal.store.getEntitlement("qa-terminal")).active, false);
+});
+
 test("recognized lifecycle events produce bounded evidence and terminal cancellation revokes access", async context => {
   const fixture = await temporaryStore(context);
   const base = Date.now() - 30_000;

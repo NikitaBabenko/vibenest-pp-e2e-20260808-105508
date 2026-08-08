@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { gzipSync } from "node:zlib";
 import { computeManifestDigest, requiredLifecycleEvidence, signEvent } from "../src/project-payments.mjs";
-import { createApp } from "../src/server.mjs";
+import { createApp, resolveEvidenceScopedStorePath } from "../src/server.mjs";
 
 const secret = `qa-runtime-${"r".repeat(40)}`;
 const environmentId = `sim_env_${"1".repeat(24)}`;
@@ -15,6 +15,21 @@ const oneTimeProductId = `sim_prod_${"4".repeat(24)}`;
 const oneTimePriceId = `sim_price_${"5".repeat(24)}`;
 const buyer = "qa-buyer-01";
 const commitSha = "a".repeat(40);
+
+test("durable verifier evidence is partitioned by environment, manifest, and exact SOURCE_COMMIT", () => {
+  const basePath = join(tmpdir(), "project-payments.sqlite");
+  const identity = {
+    environmentId,
+    manifestDigest: computeManifestDigest(),
+    builtCommit: commitSha
+  };
+  const current = resolveEvidenceScopedStorePath(basePath, identity);
+  assert.equal(resolveEvidenceScopedStorePath(basePath, identity), current);
+  assert.notEqual(resolveEvidenceScopedStorePath(basePath, { ...identity, builtCommit: "b".repeat(40) }), current);
+  assert.notEqual(resolveEvidenceScopedStorePath(basePath, { ...identity, manifestDigest: "c".repeat(64) }), current);
+  assert.notEqual(resolveEvidenceScopedStorePath(basePath, { ...identity, environmentId: `sim_env_${"d".repeat(24)}` }), current);
+  assert.equal(resolveEvidenceScopedStorePath(basePath, null), basePath);
+});
 
 test("checkout, price preview, and portal are authenticated and buyer-isolated", async context => {
   const fixture = await simulatorServer(context);

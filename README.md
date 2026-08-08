@@ -10,9 +10,14 @@ and `/api/me` behavior remain intact.
 15.00/month and Lifetime at USD 15.00 one time. Both use authenticated `user_id` buyers and
 grant `team_exports` from the runtime-issued catalog mapping only. Pro access follows the
 signed authoritative billing period; Lifetime is an independently tracked one-time source.
+Authorization reads a derived subject/grant aggregate that is recomputed by summing every
+available paid-source contribution in the same transaction as each webhook effect.
 The customer portal is enabled, scheduled cancellation preserves access through the signed
-period end, immediate cancellation/refund revokes only its source after the terminal signed
-event, and the refund window is 14 days.
+period end, and a refund revokes only the exact trusted transaction source. A recurring refund
+copies its transaction-to-subscription binding into a durable projection and fences the whole
+linked subscription against resurrection. `immediate-refund` evidence appears only when the
+approved refund and terminal subscription cancellation have both persisted, in either order.
+The refund window is 14 days.
 
 Economic estimate: VibeNest's planned fee is 1% of Eligible Sales. Paddle's public standard
 fee is separately estimated at 5% + USD 0.50 per checkout transaction. The simulator
@@ -92,7 +97,14 @@ and every verifier secret; those values belong only to the isolated preview runt
 The disposable preview requires Node 22.13 or newer and uses built-in `node:sqlite` with a
 real database under `.data/`. Webhook rows have a unique destination/event key, due and
 lease columns, conditional claims, expired-lease recovery, and transactional effect/cache
-updates. The internal restart probe persists both receiving and processing process IDs, is
+updates. Paid access is stored as immutable `transaction:{id}` one-time and
+`subscription:{id}` recurring source rows plus a separately persisted derived aggregate used
+for every protected authorization check. A recurring source advances its latest-transaction
+pointer without rewriting the independently immutable transaction projections. Trusted
+transaction, subscription, and refund
+projections preserve the refund binding; exact-transaction and subscription-wide terminal
+fences reject any later reactivation while treating events at or before approval as stale.
+The internal restart probe persists both receiving and processing process IDs, is
 ineligible to its receiving boot, and has no buyer, entitlement, transaction, or revenue
 effect. Signed billing-period bounds and event occurrence time are both persisted and fenced;
 renewal must advance exactly one trusted interval. The runtime-issued camelCase catalog is

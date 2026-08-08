@@ -35,7 +35,31 @@ CREATE INDEX ix_project_payment_webhook_event_expired_lease
     WHERE processed_at IS NULL AND lease_expires_at IS NOT NULL;
 
 CREATE TABLE project_payment_entitlement (
-    id uuid PRIMARY KEY,
+    subject_key text NOT NULL,
+    grant_key text NOT NULL,
+    quantity integer NOT NULL CHECK (quantity >= 0),
+    status text NOT NULL,
+    effective_from timestamptz NOT NULL,
+    effective_until timestamptz NULL,
+    period_starts_at timestamptz NULL,
+    period_ends_at timestamptz NULL,
+    source_price_key text NOT NULL,
+    source_event_id text NOT NULL,
+    last_occurred_at timestamptz NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (subject_key, grant_key),
+    CONSTRAINT ck_project_payment_entitlement_status
+        CHECK (status IN ('active', 'scheduled_cancel', 'revoked', 'expired'))
+);
+
+CREATE INDEX ix_project_payment_entitlement_active
+    ON project_payment_entitlement (subject_key, grant_key, effective_until)
+    WHERE status IN ('active', 'scheduled_cancel');
+
+-- Immutable paid-source contributions. Authorization never reads one row directly: the
+-- subject/grant aggregate above is rebuilt from every active or scheduled contribution in
+-- the same transaction that applies the source event and marks its inbox row processed.
+CREATE TABLE project_payment_entitlement_source (
     subject_key text NOT NULL,
     grant_key text NOT NULL,
     source_key text NOT NULL,
@@ -48,14 +72,16 @@ CREATE TABLE project_payment_entitlement (
     source_price_key text NOT NULL,
     source_event_id text NOT NULL,
     last_occurred_at timestamptz NOT NULL,
+    latest_transaction_id text NULL,
     updated_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT uq_project_payment_entitlement UNIQUE (subject_key, grant_key, source_key),
-    CONSTRAINT ck_project_payment_entitlement_status
+    PRIMARY KEY (subject_key, grant_key, source_key),
+    CONSTRAINT uq_project_payment_entitlement_source_binding UNIQUE (grant_key, source_key),
+    CONSTRAINT ck_project_payment_entitlement_source_status
         CHECK (status IN ('active', 'scheduled_cancel', 'revoked', 'expired'))
 );
 
-CREATE INDEX ix_project_payment_entitlement_active
-    ON project_payment_entitlement (subject_key, grant_key, effective_until)
+CREATE INDEX ix_project_payment_entitlement_source_active
+    ON project_payment_entitlement_source (subject_key, grant_key, effective_until)
     WHERE status IN ('active', 'scheduled_cancel');
 
 CREATE TABLE project_payment_evidence (
@@ -72,7 +98,9 @@ CREATE TABLE project_payment_ordering_clock (
 );
 
 -- Bounded support projections for catalog mappings, transactions, subscriptions,
--- declines, and refunds. Each value is derived only from a verified normalized event.
+-- declines, and refunds. Transaction projections carry their trusted subscription
+-- binding. An approved refund copies that binding into its refund projection; exact
+-- transaction and linked-subscription fences prevent any later source resurrection.
 CREATE TABLE project_payment_projection (
     namespace text NOT NULL,
     projection_key text NOT NULL,
@@ -81,9 +109,12 @@ CREATE TABLE project_payment_projection (
 );
 
 -- The application must apply the conditional entitlement upsert and mark the
--- corresponding inbox row processed in one transaction. Recurring sources fence first
--- on the signed billing-period bounds and then on last_occurred_at; terminal events may
--- revoke immediately but an older event can never reactivate a terminal source.
+-- corresponding inbox row processed in one transaction, then rebuild the authorization
+-- aggregate by summing every available source. Recurring sources fence first on the signed
+-- billing-period bounds and then on last_occurred_at; terminal events may revoke immediately
+-- but an older event can never reactivate a terminal source. `immediate-refund` evidence is
+-- inserted only after a trusted approved refund and linked terminal subscription cancellation
+-- have both converged, in either delivery order.
 -- The internal restart/replay probe uses the same inbox. Its receiving instance cannot
 -- claim it; only a different process instance may process the inert row and insert the
 -- exact-scope (scope_digest, 'restart-replay') evidence record once.

@@ -375,6 +375,9 @@ export async function acceptSignedEvent({
   runtimeCatalog,
   store
 }) {
+  if (destinationKey !== environmentId) {
+    throw new ProjectPaymentError("WEBHOOK_DESTINATION_INVALID", "The webhook destination does not match the simulator environment.");
+  }
   if (!verifyEventSignature(rawBody, signature, secret, nowSeconds)) {
     throw new ProjectPaymentError("WEBHOOK_SIGNATURE_INVALID", "The simulator signature is invalid.");
   }
@@ -449,6 +452,7 @@ function normalizeTransaction(eventType, data, environmentId, runtimeCatalog) {
   assertTrustedTotals(data.details.totals, mapping);
   return {
     kind: eventType === "transaction.completed" ? "transaction_completed" : "transaction_declined",
+    environmentId,
     subjectKey: data.customer_id,
     transactionId: data.id,
     subscriptionId: data.subscription_id,
@@ -491,6 +495,7 @@ function normalizeSubscription(eventType, data, environmentId, runtimeCatalog, o
         : scheduledCancelAt === null
           ? "subscription_renewed"
           : "subscription_scheduled_cancel",
+    environmentId,
     subjectKey: data.customer_id,
     subscriptionId: data.id,
     scheduledCancelAt,
@@ -511,6 +516,7 @@ function normalizeAdjustment(eventType, data, environmentId) {
   if (data.status !== expectedStatus) throw invalidPayload("The adjustment status does not match its event type.");
   return {
     kind: eventType === "adjustment.created" ? "refund_pending" : "refund_approved",
+    environmentId,
     adjustmentId: data.id,
     transactionId: data.transaction_id,
     unitAmount: totals.unitAmount,
@@ -535,6 +541,7 @@ function normalizePortal(data, environmentId, occurredAt) {
   }
   return {
     kind: "portal_created",
+    environmentId,
     subjectKey: data.customer_id,
     portalSessionId: data.id,
     orderingKey: `portal:${data.customer_id}`
@@ -646,7 +653,7 @@ export class DurableProjectPaymentStore {
         CREATE INDEX IF NOT EXISTS ix_project_payment_webhook_event_due
           ON project_payment_webhook_event (next_attempt_at, sequence)
           WHERE processed_at IS NULL AND dead_lettered_at IS NULL;
-        CREATE TABLE IF NOT EXISTS project_payment_entitlement_cache (
+        CREATE TABLE IF NOT EXISTS project_payment_entitlement_source (
           subject_key TEXT NOT NULL,
           grant_key TEXT NOT NULL,
           source_key TEXT NOT NULL,
@@ -659,12 +666,29 @@ export class DurableProjectPaymentStore {
           source_price_key TEXT NOT NULL,
           source_event_id TEXT NOT NULL,
           last_occurred_at TEXT NOT NULL,
+          latest_transaction_id TEXT NULL,
           updated_at TEXT NOT NULL,
-          PRIMARY KEY (subject_key, grant_key, source_key)
+          PRIMARY KEY (subject_key, grant_key, source_key),
+          UNIQUE (grant_key, source_key)
         );
-        CREATE INDEX IF NOT EXISTS ix_project_payment_entitlement_cache_active
-          ON project_payment_entitlement_cache (subject_key, grant_key, effective_until)
+        CREATE INDEX IF NOT EXISTS ix_project_payment_entitlement_source_active
+          ON project_payment_entitlement_source (subject_key, grant_key, effective_until)
           WHERE status IN ('active', 'scheduled_cancel');
+        CREATE TABLE IF NOT EXISTS project_payment_entitlement (
+          subject_key TEXT NOT NULL,
+          grant_key TEXT NOT NULL,
+          quantity INTEGER NOT NULL CHECK (quantity >= 0),
+          status TEXT NOT NULL CHECK (status IN ('active', 'scheduled_cancel', 'revoked', 'expired')),
+          effective_from TEXT NOT NULL,
+          effective_until TEXT NULL,
+          period_starts_at TEXT NULL,
+          period_ends_at TEXT NULL,
+          source_price_key TEXT NOT NULL,
+          source_event_id TEXT NOT NULL,
+          last_occurred_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (subject_key, grant_key)
+        );
         CREATE TABLE IF NOT EXISTS project_payment_evidence (
           name TEXT PRIMARY KEY
         );
@@ -684,6 +708,31 @@ export class DurableProjectPaymentStore {
       );
       if (!inboxColumns.has("processed_instance_id")) {
         database.exec("ALTER TABLE project_payment_webhook_event ADD COLUMN processed_instance_id TEXT NULL;");
+      }
+      const sourceColumns = new Set(
+        database.prepare("PRAGMA table_info(project_payment_entitlement_source)").all().map(column => column.name)
+      );
+      if (!sourceColumns.has("latest_transaction_id")) {
+        database.exec("ALTER TABLE project_payment_entitlement_source ADD COLUMN latest_transaction_id TEXT NULL;");
+      }
+      const legacySourceTable = database.prepare(`
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'project_payment_entitlement_cache'
+      `).get();
+      if (legacySourceTable) {
+        database.exec(`
+          INSERT OR IGNORE INTO project_payment_entitlement_source (
+            subject_key, grant_key, source_key, quantity, status, effective_from,
+            effective_until, period_starts_at, period_ends_at, source_price_key,
+            source_event_id, last_occurred_at, latest_transaction_id, updated_at
+          )
+          SELECT subject_key, grant_key, source_key, quantity, status, effective_from,
+            effective_until, period_starts_at, period_ends_at, source_price_key,
+            source_event_id, last_occurred_at,
+            CASE WHEN source_key LIKE 'transaction:%' THEN substr(source_key, 13) ELSE NULL END,
+            updated_at
+          FROM project_payment_entitlement_cache;
+        `);
       }
     } finally {
       database.close();
@@ -856,22 +905,16 @@ export class DurableProjectPaymentStore {
   async getEntitlement(subjectKey, grantKey = trustedCatalog.entitlement, now = this.clock()) {
     assertBuyerKey(subjectKey);
     const state = await this.snapshot();
-    const rows = Object.values(state.entitlements)
-      .filter(entitlement => entitlement.subjectKey === subjectKey && entitlement.grantKey === grantKey);
-    const activeRows = rows.filter(entitlement => (entitlement.status === "active" || entitlement.status === "scheduled_cancel")
-      && (entitlement.effectiveUntil === null || Date.parse(entitlement.effectiveUntil) > toDate(now).getTime()));
-    if (activeRows.length === 0) {
-      const latest = rows.sort((left, right) => Date.parse(right.lastOccurredAt) - Date.parse(left.lastOccurredAt))[0];
-      return { active: false, status: latest?.status ?? null, effectiveUntil: latest?.effectiveUntil ?? null };
-    }
-    const hasUnlimited = activeRows.some(entitlement => entitlement.effectiveUntil === null);
-    const effectiveUntil = hasUnlimited
-      ? null
-      : activeRows.map(entitlement => entitlement.effectiveUntil).sort().at(-1);
+    const aggregate = state.entitlementAggregates[`${subjectKey}:${grantKey}`];
+    if (!aggregate) return { active: false, status: null, effectiveUntil: null };
+    const active = (aggregate.status === "active" || aggregate.status === "scheduled_cancel")
+      && aggregate.quantity > 0
+      && Date.parse(aggregate.effectiveFrom) <= toDate(now).getTime()
+      && (aggregate.effectiveUntil === null || Date.parse(aggregate.effectiveUntil) > toDate(now).getTime());
     return {
-      active: true,
-      status: activeRows.some(entitlement => entitlement.status === "active") ? "active" : "scheduled_cancel",
-      effectiveUntil
+      active,
+      status: aggregate.status,
+      effectiveUntil: aggregate.effectiveUntil
     };
   }
 
@@ -1015,7 +1058,7 @@ function readSnapshot(database) {
 
 function readProjectionState(database) {
   const state = normalizeState({});
-  for (const row of database.prepare(`SELECT * FROM project_payment_entitlement_cache`).all()) {
+  for (const row of database.prepare(`SELECT * FROM project_payment_entitlement_source`).all()) {
     const key = `${row.subject_key}:${row.grant_key}:${row.source_key}`;
     state.entitlements[key] = {
       subjectKey: row.subject_key,
@@ -1030,8 +1073,35 @@ function readProjectionState(database) {
       sourcePriceKey: row.source_price_key,
       sourceEventId: row.source_event_id,
       lastOccurredAt: row.last_occurred_at,
+      latestTransactionId: row.latest_transaction_id,
       updatedAt: row.updated_at
     };
+  }
+  for (const row of database.prepare(`SELECT * FROM project_payment_entitlement`).all()) {
+    const key = `${row.subject_key}:${row.grant_key}`;
+    state.entitlementAggregates[key] = {
+      subjectKey: row.subject_key,
+      grantKey: row.grant_key,
+      quantity: Number(row.quantity),
+      status: row.status,
+      effectiveFrom: row.effective_from,
+      effectiveUntil: row.effective_until,
+      periodStartsAt: row.period_starts_at,
+      periodEndsAt: row.period_ends_at,
+      sourcePriceKey: row.source_price_key,
+      sourceEventId: row.source_event_id,
+      lastOccurredAt: row.last_occurred_at,
+      updatedAt: row.updated_at
+    };
+  }
+  if (Object.keys(state.entitlementAggregates).length === 0 && Object.keys(state.entitlements).length > 0) {
+    const aggregateKeys = new Set(
+      Object.values(state.entitlements).map(row => `${row.subjectKey}\0${row.grantKey}`)
+    );
+    for (const composite of aggregateKeys) {
+      const [subjectKey, grantKey] = composite.split("\0");
+      rebuildEntitlementAggregate(state, subjectKey, grantKey);
+    }
   }
   state.evidence = database.prepare(`SELECT name FROM project_payment_evidence ORDER BY name`).all().map(row => row.name);
   for (const row of database.prepare(`SELECT ordering_key, occurred_at FROM project_payment_ordering_clock`).all()) {
@@ -1051,13 +1121,13 @@ function readProjectionState(database) {
 }
 
 function writeProjectionState(database, state) {
-  database.exec("DELETE FROM project_payment_entitlement_cache; DELETE FROM project_payment_evidence; DELETE FROM project_payment_projection;");
+  database.exec("DELETE FROM project_payment_entitlement_source; DELETE FROM project_payment_entitlement; DELETE FROM project_payment_evidence; DELETE FROM project_payment_projection;");
   const entitlementStatement = database.prepare(`
-    INSERT INTO project_payment_entitlement_cache (
+    INSERT INTO project_payment_entitlement_source (
       subject_key, grant_key, source_key, quantity, status, effective_from,
       effective_until, period_starts_at, period_ends_at, source_price_key,
-      source_event_id, last_occurred_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      source_event_id, last_occurred_at, latest_transaction_id, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   for (const entitlement of Object.values(state.entitlements)) {
     entitlementStatement.run(
@@ -1073,7 +1143,31 @@ function writeProjectionState(database, state) {
       entitlement.sourcePriceKey,
       entitlement.sourceEventId,
       entitlement.lastOccurredAt,
+      entitlement.latestTransactionId,
       entitlement.updatedAt
+    );
+  }
+  const aggregateStatement = database.prepare(`
+    INSERT INTO project_payment_entitlement (
+      subject_key, grant_key, quantity, status, effective_from, effective_until,
+      period_starts_at, period_ends_at, source_price_key, source_event_id,
+      last_occurred_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const aggregate of Object.values(state.entitlementAggregates)) {
+    aggregateStatement.run(
+      aggregate.subjectKey,
+      aggregate.grantKey,
+      aggregate.quantity,
+      aggregate.status,
+      aggregate.effectiveFrom,
+      aggregate.effectiveUntil,
+      aggregate.periodStartsAt,
+      aggregate.periodEndsAt,
+      aggregate.sourcePriceKey,
+      aggregate.sourceEventId,
+      aggregate.lastOccurredAt,
+      aggregate.updatedAt
     );
   }
   for (const name of state.evidence) insertEvidence(database, name);
@@ -1184,22 +1278,26 @@ function applyNormalizedEvent(state, event) {
   if (normalized.providerPriceId) persistCatalogMapping(state, normalized);
   if (normalized.subscriptionId) validateSubscriptionIdentity(state, normalized);
   if (normalized.kind === "transaction_completed") validateTransactionIdentity(state, normalized);
+  const terminalRefundFence = validateTerminalRefundFence(state, event);
+  if (terminalRefundFence === "stale") {
+    addEvidence(state, "out-of-order-delivery");
+    return { ignored: true };
+  }
 
   switch (normalized.kind) {
     case "transaction_completed":
       {
+        const existingTransaction = state.transactions[normalized.transactionId];
+        if (existingTransaction) return { ignored: true };
         validateRecurringTransactionPeriod(state, normalized);
-        const result = upsertEntitlement(
-          state,
-          event,
-          "active",
-          normalized.periodEndsAt
-        );
-        if (result.ignored) return result;
         state.transactions[normalized.transactionId] = {
+          transactionId: normalized.transactionId,
+          environmentId: normalized.environmentId,
           subjectKey: normalized.subjectKey,
           subscriptionId: normalized.subscriptionId,
+          providerProductId: normalized.providerProductId,
           providerPriceId: normalized.providerPriceId,
+          productKey: normalized.productKey,
           priceKey: normalized.priceKey,
           priceType: normalized.type,
           unitAmount: normalized.unitAmount,
@@ -1208,9 +1306,17 @@ function applyNormalizedEvent(state, event) {
           sourceKey: sourceKeyFor(normalized),
           periodStartsAt: normalized.periodStartsAt,
           periodEndsAt: normalized.periodEndsAt,
-          occurredAt: event.occurredAt
+          occurredAt: event.occurredAt,
+          sourceEventId: event.providerEventId
         };
-        if (normalized.subscriptionId !== null) persistSubscription(state, event, "active");
+        const result = upsertEntitlement(
+          state,
+          event,
+          "active",
+          normalized.periodEndsAt
+        );
+        linkTransactionToSource(state, normalized);
+        if (!result.ignored && normalized.subscriptionId !== null) persistSubscription(state, event, "active");
         addEvidence(state, normalized.type === "one_time" ? "one-time-purchase" : "subscription-purchase");
         return result;
       }
@@ -1254,8 +1360,37 @@ function applyNormalizedEvent(state, event) {
     case "subscription_canceled":
       {
         requireSourceEntitlements(state, event.normalized);
-        const result = upsertEntitlement(state, event, "revoked", event.occurredAt, { terminal: true });
-        if (!result.ignored) persistSubscription(state, event, "revoked");
+        const cancellation = validateCancellationProjection(state, event);
+        if (cancellation.ignored) {
+          addEvidence(state, "out-of-order-delivery");
+          recordImmediateRefundIfComplete(state, normalized.subscriptionId);
+          return { ignored: true };
+        }
+        const result = upsertEntitlementForSubject(
+          state,
+          normalized.subjectKey,
+          event,
+          "revoked",
+          event.occurredAt,
+          normalized.grants,
+          normalized.priceKey,
+          sourceKeyFor(normalized),
+          cancellation.periodStartsAt,
+          cancellation.periodEndsAt,
+          { terminal: true, forceTerminal: true }
+        );
+        const linkedRefund = findSubscriptionRefund(state, normalized.subscriptionId);
+        if (!result.ignored || linkedRefund) {
+          persistSubscription(
+            state,
+            event,
+            "revoked",
+            cancellation.periodStartsAt,
+            cancellation.periodEndsAt
+          );
+          recordImmediateRefundIfComplete(state, normalized.subscriptionId);
+          return { ignored: false };
+        }
         return result;
       }
     case "refund_pending":
@@ -1264,7 +1399,36 @@ function applyNormalizedEvent(state, event) {
     case "refund_approved":
       {
         const transaction = validateRefundTransaction(state, normalized);
-        const result = upsertEntitlementForSubject(
+        if (Date.parse(event.occurredAt) < Date.parse(transaction.occurredAt)) {
+          throw new ProjectPaymentError("REFUND_PRECEDES_TRANSACTION", "The refund predates its trusted transaction projection.");
+        }
+        const existingRefund = state.refundedTransactions[normalized.transactionId];
+        if (existingRefund) {
+          validateRefundProjectionIdentity(existingRefund, transaction);
+          if (Date.parse(event.occurredAt) <= Date.parse(existingRefund.approvedAt)) {
+            addEvidence(state, "out-of-order-delivery");
+          }
+          return { ignored: true };
+        }
+        const refundProjection = {
+          transactionId: normalized.transactionId,
+          subscriptionId: transaction.subscriptionId,
+          environmentId: transaction.environmentId,
+          subjectKey: transaction.subjectKey,
+          providerProductId: transaction.providerProductId,
+          providerPriceId: transaction.providerPriceId,
+          productKey: transaction.productKey,
+          priceKey: transaction.priceKey,
+          priceType: transaction.priceType,
+          unitAmount: transaction.unitAmount,
+          currency: transaction.currency,
+          grants: transaction.grants,
+          sourceKey: transaction.sourceKey,
+          approvedAt: event.occurredAt,
+          sourceEventId: event.providerEventId
+        };
+        state.refundedTransactions[normalized.transactionId] = refundProjection;
+        upsertEntitlementForSubject(
           state,
           transaction.subjectKey,
           event,
@@ -1275,13 +1439,11 @@ function applyNormalizedEvent(state, event) {
           transaction.sourceKey,
           transaction.periodStartsAt,
           transaction.periodEndsAt,
-          { terminal: true }
+          { terminal: true, forceTerminal: true }
         );
-        if (result.ignored) return result;
+        recordImmediateRefundIfComplete(state, transaction.subscriptionId);
+        return { ignored: false };
       }
-      state.refundedTransactions[normalized.transactionId] = event.occurredAt;
-      addEvidence(state, "immediate-refund");
-      return { ignored: false };
     case "portal_created":
       addEvidence(state, "customer-portal");
       return { ignored: false };
@@ -1326,6 +1488,10 @@ function upsertEntitlementForSubject(
     throw new ProjectPaymentError("WEBHOOK_PAYLOAD_INVALID", "The entitlement source is invalid.");
   }
   const currentRows = grants.map(grant => state.entitlements[`${subjectKey}:${grant.entitlement}:${sourceKey}`]).filter(Boolean);
+  if (options.forceTerminal === true && currentRows.length === grants.length
+      && currentRows.every(current => current.status === "revoked")) {
+    return { ignored: true };
+  }
   const stale = currentRows.some(current => eventIsOlder(current, event, periodStartsAt, periodEndsAt, options));
   if (stale) {
     addEvidence(state, "out-of-order-delivery");
@@ -1350,13 +1516,86 @@ function upsertEntitlementForSubject(
       sourcePriceKey,
       sourceEventId: event.providerEventId,
       lastOccurredAt: event.occurredAt,
+      latestTransactionId: event.normalized.kind === "transaction_completed"
+        ? event.normalized.transactionId
+        : current?.latestTransactionId ?? null,
       updatedAt: new Date().toISOString()
     };
+    rebuildEntitlementAggregate(state, subjectKey, grant.entitlement);
   }
   return { ignored: false };
 }
 
+function linkTransactionToSource(state, normalized) {
+  if (normalized.kind !== "transaction_completed") return false;
+  let changed = false;
+  for (const grant of normalized.grants) {
+    const key = `${normalized.subjectKey}:${grant.entitlement}:${sourceKeyFor(normalized)}`;
+    const source = state.entitlements[key];
+    if (!source || source.periodStartsAt !== normalized.periodStartsAt
+        || source.periodEndsAt !== normalized.periodEndsAt) continue;
+    const previous = source.latestTransactionId
+      ? state.transactions[source.latestTransactionId]
+      : null;
+    if (previous && (Date.parse(previous.periodEndsAt ?? previous.occurredAt) > Date.parse(normalized.periodEndsAt ?? normalized.occurredAt)
+        || (previous.periodEndsAt === normalized.periodEndsAt
+          && Date.parse(previous.occurredAt) > Date.parse(normalized.occurredAt)))) continue;
+    source.latestTransactionId = normalized.transactionId;
+    source.updatedAt = new Date().toISOString();
+    rebuildEntitlementAggregate(state, normalized.subjectKey, grant.entitlement);
+    changed = true;
+  }
+  return changed;
+}
+
+function rebuildEntitlementAggregate(state, subjectKey, grantKey) {
+  const sources = Object.values(state.entitlements)
+    .filter(row => row.subjectKey === subjectKey && row.grantKey === grantKey);
+  if (sources.length === 0) {
+    delete state.entitlementAggregates[`${subjectKey}:${grantKey}`];
+    return null;
+  }
+  const available = sources.filter(row => row.status === "active" || row.status === "scheduled_cancel");
+  const latest = [...sources].sort((left, right) =>
+    Date.parse(right.lastOccurredAt) - Date.parse(left.lastOccurredAt)
+    || right.sourceEventId.localeCompare(left.sourceEventId, "en"))[0];
+  const status = available.some(row => row.status === "active")
+    ? "active"
+    : available.length > 0
+      ? "scheduled_cancel"
+      : "revoked";
+  const activeQuantity = available.reduce((total, row) => total + row.quantity, 0);
+  const effectiveFrom = available.length > 0
+    ? new Date(Math.min(...available.map(row => Date.parse(row.effectiveFrom)))).toISOString()
+    : latest.effectiveFrom;
+  const effectiveUntil = available.length === 0
+    ? latest.effectiveUntil
+    : available.some(row => row.effectiveUntil === null)
+      ? null
+      : new Date(Math.max(...available.map(row => Date.parse(row.effectiveUntil)))).toISOString();
+  const periodSource = [...(available.length > 0 ? available : sources)]
+    .filter(row => row.periodEndsAt !== null)
+    .sort((left, right) => Date.parse(right.periodEndsAt) - Date.parse(left.periodEndsAt))[0] ?? latest;
+  const aggregate = {
+    subjectKey,
+    grantKey,
+    quantity: activeQuantity,
+    status,
+    effectiveFrom,
+    effectiveUntil,
+    periodStartsAt: periodSource.periodStartsAt,
+    periodEndsAt: periodSource.periodEndsAt,
+    sourcePriceKey: latest.sourcePriceKey,
+    sourceEventId: latest.sourceEventId,
+    lastOccurredAt: latest.lastOccurredAt,
+    updatedAt: latest.updatedAt
+  };
+  state.entitlementAggregates[`${subjectKey}:${grantKey}`] = aggregate;
+  return aggregate;
+}
+
 function eventIsOlder(current, event, periodStartsAt, periodEndsAt, options) {
+  if (options.forceTerminal === true) return false;
   const occurrenceIsOlder = Date.parse(event.occurredAt) < Date.parse(current.lastOccurredAt);
   if (occurrenceIsOlder) return true;
   if (options.terminal === true) return false;
@@ -1394,18 +1633,121 @@ function validateRefundTransaction(state, normalized) {
   if (!transaction) {
     throw new ProjectPaymentError("REFUND_TRANSACTION_UNKNOWN", "The refund references an unknown transaction.");
   }
-  if (transaction.unitAmount !== normalized.unitAmount || transaction.currency !== normalized.currency) {
+  if (transaction.environmentId !== normalized.environmentId
+      || transaction.unitAmount !== normalized.unitAmount
+      || transaction.currency !== normalized.currency) {
     throw new ProjectPaymentError("WEBHOOK_CATALOG_MISMATCH", "The refund totals do not match the trusted transaction.");
   }
   return transaction;
 }
 
+function validateRefundProjectionIdentity(refund, transaction) {
+  if (refund.transactionId !== transaction.transactionId
+      || refund.subscriptionId !== transaction.subscriptionId
+      || refund.environmentId !== transaction.environmentId
+      || refund.subjectKey !== transaction.subjectKey
+      || refund.providerProductId !== transaction.providerProductId
+      || refund.providerPriceId !== transaction.providerPriceId
+      || refund.productKey !== transaction.productKey
+      || refund.priceKey !== transaction.priceKey
+      || refund.priceType !== transaction.priceType
+      || refund.unitAmount !== transaction.unitAmount
+      || refund.currency !== transaction.currency
+      || refund.sourceKey !== transaction.sourceKey
+      || JSON.stringify(refund.grants) !== JSON.stringify(transaction.grants)) {
+    throw new ProjectPaymentError("REFUND_BINDING_COLLISION", "The refund binding differs from its trusted transaction projection.");
+  }
+}
+
+function validateTerminalRefundFence(state, event) {
+  const normalized = event.normalized;
+  let refunds = [];
+  if (normalized.kind === "transaction_completed") {
+    const exact = state.refundedTransactions[normalized.transactionId];
+    if (exact) refunds.push(exact);
+    if (normalized.subscriptionId) {
+      refunds = refunds.concat(findSubscriptionRefunds(state, normalized.subscriptionId));
+    }
+  } else if ([
+    "subscription_created",
+    "subscription_renewed",
+    "subscription_scheduled_cancel"
+  ].includes(normalized.kind)) {
+    refunds = findSubscriptionRefunds(state, normalized.subscriptionId);
+  } else {
+    return null;
+  }
+  if (refunds.length === 0) return null;
+  const approvedAt = refunds
+    .map(refund => refund.approvedAt)
+    .sort((left, right) => Date.parse(left) - Date.parse(right))[0];
+  if (Date.parse(event.occurredAt) <= Date.parse(approvedAt)) return "stale";
+  throw new ProjectPaymentError(
+    "TERMINAL_REFUND_FENCE",
+    "A refunded transaction or subscription source cannot be reactivated."
+  );
+}
+
+function findSubscriptionRefunds(state, subscriptionId) {
+  if (!subscriptionId) return [];
+  return Object.values(state.refundedTransactions)
+    .filter(refund => refund?.subscriptionId === subscriptionId);
+}
+
+function findSubscriptionRefund(state, subscriptionId) {
+  return findSubscriptionRefunds(state, subscriptionId)
+    .sort((left, right) => Date.parse(left.approvedAt) - Date.parse(right.approvedAt))[0] ?? null;
+}
+
+function validateCancellationProjection(state, event) {
+  const normalized = event.normalized;
+  const current = state.subscriptions[normalized.subscriptionId];
+  if (!current) {
+    throw new ProjectPaymentError("SUBSCRIPTION_STATE_MISSING", "The cancellation has no trusted subscription projection.");
+  }
+  const linkedRefund = findSubscriptionRefund(state, normalized.subscriptionId);
+  if (current.periodStartsAt !== normalized.periodStartsAt
+      || current.periodEndsAt !== normalized.periodEndsAt) {
+    if (linkedRefund && Date.parse(normalized.periodEndsAt) <= Date.parse(current.periodEndsAt)) {
+      return {
+        ignored: false,
+        periodStartsAt: current.periodStartsAt,
+        periodEndsAt: current.periodEndsAt
+      };
+    }
+    if (Date.parse(normalized.periodEndsAt) <= Date.parse(current.periodEndsAt)) return { ignored: true };
+    throw new ProjectPaymentError("SUBSCRIPTION_PERIOD_INVALID", "The cancellation does not reuse the trusted subscription period.");
+  }
+  if (current.status === "revoked") return { ignored: true };
+  if (current.status !== "active" && current.status !== "scheduled_cancel") {
+    throw new ProjectPaymentError("SUBSCRIPTION_STATE_INVALID", "The cancellation requires an active subscription projection.");
+  }
+  return {
+    ignored: false,
+    periodStartsAt: current.periodStartsAt,
+    periodEndsAt: current.periodEndsAt
+  };
+}
+
+function recordImmediateRefundIfComplete(state, subscriptionId) {
+  if (!subscriptionId) return false;
+  const subscription = state.subscriptions[subscriptionId];
+  const refund = findSubscriptionRefund(state, subscriptionId);
+  if (subscription?.status !== "revoked" || !refund) return false;
+  addEvidence(state, "immediate-refund");
+  return true;
+}
+
 function validateSubscriptionIdentity(state, normalized) {
   const current = state.subscriptions[normalized.subscriptionId];
   if (!current) return true;
-  if (current.subjectKey !== normalized.subjectKey
+  if (current.environmentId !== normalized.environmentId
+      || current.subjectKey !== normalized.subjectKey
+      || current.providerProductId !== normalized.providerProductId
       || current.providerPriceId !== normalized.providerPriceId
-      || current.priceKey !== normalized.priceKey) {
+      || current.productKey !== normalized.productKey
+      || current.priceKey !== normalized.priceKey
+      || JSON.stringify(current.grants) !== JSON.stringify(normalized.grants)) {
     throw new ProjectPaymentError("SUBSCRIPTION_ID_COLLISION", "The subscription identifier conflicts with its trusted buyer or catalog mapping.");
   }
   return true;
@@ -1414,11 +1756,21 @@ function validateSubscriptionIdentity(state, normalized) {
 function validateTransactionIdentity(state, normalized) {
   const current = state.transactions[normalized.transactionId];
   if (!current) return true;
-  if (current.subjectKey !== normalized.subjectKey
+  if (current.environmentId !== normalized.environmentId
+      || current.subjectKey !== normalized.subjectKey
       || current.subscriptionId !== normalized.subscriptionId
+      || current.providerProductId !== normalized.providerProductId
       || current.providerPriceId !== normalized.providerPriceId
+      || current.productKey !== normalized.productKey
+      || current.priceKey !== normalized.priceKey
+      || current.priceType !== normalized.type
       || current.unitAmount !== normalized.unitAmount
-      || current.currency !== normalized.currency) {
+      || current.currency !== normalized.currency
+      || current.sourceKey !== sourceKeyFor(normalized)
+      || current.periodStartsAt !== normalized.periodStartsAt
+      || current.periodEndsAt !== normalized.periodEndsAt
+      || current.occurredAt !== normalized.occurredAt
+      || JSON.stringify(current.grants) !== JSON.stringify(normalized.grants)) {
     throw new ProjectPaymentError("TRANSACTION_ID_COLLISION", "The transaction identifier conflicts with its trusted buyer or catalog mapping.");
   }
   return true;
@@ -1448,16 +1800,26 @@ function validateRecurringTransactionPeriod(state, normalized) {
   return true;
 }
 
-function persistSubscription(state, event, status) {
+function persistSubscription(
+  state,
+  event,
+  status,
+  periodStartsAt = event.normalized.periodStartsAt,
+  periodEndsAt = event.normalized.periodEndsAt
+) {
   const normalized = event.normalized;
   state.subscriptions[normalized.subscriptionId] = {
+    environmentId: normalized.environmentId,
     subjectKey: normalized.subjectKey,
+    providerProductId: normalized.providerProductId,
     providerPriceId: normalized.providerPriceId,
+    productKey: normalized.productKey,
     priceKey: normalized.priceKey,
+    grants: normalized.grants,
     sourceKey: sourceKeyFor(normalized),
     status,
-    periodStartsAt: normalized.periodStartsAt,
-    periodEndsAt: normalized.periodEndsAt,
+    periodStartsAt,
+    periodEndsAt,
     sourceEventId: event.providerEventId,
     lastOccurredAt: event.occurredAt
   };
@@ -1490,6 +1852,7 @@ function normalizeState(state) {
     nextSequence: Number.isSafeInteger(state.nextSequence) ? state.nextSequence : 1,
     events: Array.isArray(state.events) ? state.events : [],
     entitlements: isObject(state.entitlements) ? state.entitlements : {},
+    entitlementAggregates: isObject(state.entitlementAggregates) ? state.entitlementAggregates : {},
     evidence: Array.isArray(state.evidence) ? [...new Set(state.evidence.filter(name => requiredLifecycleEvidence.includes(name)))] : [],
     observedClocks: isObject(state.observedClocks) ? state.observedClocks : {},
     catalogMappings: isObject(state.catalogMappings) ? state.catalogMappings : {},

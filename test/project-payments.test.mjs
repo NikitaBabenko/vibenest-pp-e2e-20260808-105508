@@ -161,6 +161,20 @@ test("signed webhook parsing is strict and pins grants to the trusted catalog", 
   wrongEnvironment.data.custom_data.vibenest_environment_id = `sim_env_${"f".repeat(24)}`;
   await assert.rejects(deliver(fixture.store, wrongEnvironment), error => error.code === "WEBHOOK_ENVIRONMENT_MISMATCH");
 
+  const wrongDestination = transactionEvent({ eventNumber: 4, transactionNumber: 4, occurredAt });
+  const wrongDestinationRaw = rawEvent(wrongDestination);
+  const wrongDestinationTimestamp = Math.floor(Date.parse(occurredAt) / 1000);
+  await assert.rejects(acceptSignedEvent({
+    rawBody: wrongDestinationRaw,
+    signature: signEvent(wrongDestinationRaw, simulatorSecret, wrongDestinationTimestamp),
+    secret: simulatorSecret,
+    nowSeconds: wrongDestinationTimestamp,
+    destinationKey: `sim_env_${"f".repeat(24)}`,
+    environmentId,
+    runtimeCatalog,
+    store: fixture.store
+  }), error => error.code === "WEBHOOK_DESTINATION_INVALID");
+
   const wrongCatalog = transactionEvent({ eventNumber: 3, transactionNumber: 3, occurredAt });
   wrongCatalog.data.items[0].price_id = `sim_price_${"9".repeat(24)}`;
   wrongCatalog.data.items[0].product_id = `sim_prod_${"8".repeat(24)}`;
@@ -215,7 +229,8 @@ test("durable inbox deduplicates, fences stale state, and recovers expired lease
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'project_payment_%'
     `).all().map(row => row.name).sort();
     assert.ok(tables.includes("project_payment_webhook_event"));
-    assert.ok(tables.includes("project_payment_entitlement_cache"));
+    assert.ok(tables.includes("project_payment_entitlement_source"));
+    assert.ok(tables.includes("project_payment_entitlement"));
   } finally {
     database.close();
   }
@@ -270,53 +285,338 @@ test("renewal advances the signed period exactly once and matching transaction d
   assert.equal(row.periodEndsAt, renewedEnd);
 });
 
-test("one-time and recurring sources remain isolated through refunds in both purchase orders", async context => {
+test("two paid sources are summed and a recurring refund plus cancellation preserves the independent source", async context => {
   const fixture = await temporaryStore(context);
   const base = Date.now() - 20_000;
-  const firstBuyer = "qa-source-order-a";
-  const secondBuyer = "qa-source-order-b";
-  const firstPeriod = at(base, 1);
-  const secondPeriod = at(base, 10);
-  const firstSubscriptionId = providerId("sim_sub", 41);
-  const secondSubscriptionId = providerId("sim_sub", 51);
-  const firstOneTimeTransaction = providerId("sim_txn", 40);
-  const firstRecurringTransaction = providerId("sim_txn", 42);
-  const secondRecurringTransaction = providerId("sim_txn", 50);
-  const secondOneTimeTransaction = providerId("sim_txn", 52);
+  const subjectKey = "qa-selective-refund";
+  const periodStart = at(base, 1);
+  const subscriptionId = providerId("sim_sub", 41);
+  const oneTimeTransaction = providerId("sim_txn", 40);
+  const recurringTransaction = providerId("sim_txn", 42);
 
   const events = [
-    transactionEvent({ eventNumber: 40, transactionNumber: 40, occurredAt: at(base, 0), subjectKey: firstBuyer }),
-    subscriptionEvent({ eventNumber: 41, subscriptionNumber: 41, eventType: "subscription.created", occurredAt: at(base, 1), subjectKey: firstBuyer, periodStartsAt: firstPeriod }),
-    transactionEvent({ eventNumber: 42, transactionNumber: 42, occurredAt: at(base, 2), subscriptionId: firstSubscriptionId, subjectKey: firstBuyer, periodStartsAt: firstPeriod }),
-    adjustmentEvent({ eventNumber: 43, adjustmentNumber: 43, transactionId: firstRecurringTransaction, eventType: "adjustment.updated", occurredAt: at(base, 3) }),
-    subscriptionEvent({ eventNumber: 50, subscriptionNumber: 51, eventType: "subscription.created", occurredAt: at(base, 10), subjectKey: secondBuyer, periodStartsAt: secondPeriod }),
-    transactionEvent({ eventNumber: 51, transactionNumber: 50, occurredAt: at(base, 11), subscriptionId: secondSubscriptionId, subjectKey: secondBuyer, periodStartsAt: secondPeriod }),
-    transactionEvent({ eventNumber: 52, transactionNumber: 52, occurredAt: at(base, 12), subjectKey: secondBuyer }),
-    adjustmentEvent({ eventNumber: 53, adjustmentNumber: 53, transactionId: secondOneTimeTransaction, eventType: "adjustment.updated", occurredAt: at(base, 13) })
+    transactionEvent({ eventNumber: 40, transactionNumber: 40, occurredAt: at(base, 0), subjectKey }),
+    subscriptionEvent({ eventNumber: 41, subscriptionNumber: 41, eventType: "subscription.created", occurredAt: at(base, 1), subjectKey, periodStartsAt: periodStart }),
+    transactionEvent({ eventNumber: 42, transactionNumber: 42, occurredAt: at(base, 2), subscriptionId, subjectKey, periodStartsAt: periodStart })
   ];
   for (const event of events) await deliver(fixture.store, event);
   assert.equal((await fixture.store.processDue()).failed, 0);
-  assert.equal((await fixture.store.getEntitlement(firstBuyer)).active, true);
-  assert.equal((await fixture.store.getEntitlement(secondBuyer)).active, true);
+  let snapshot = await fixture.store.snapshot();
+  let sources = Object.values(snapshot.entitlements).filter(row =>
+    row.subjectKey === subjectKey && row.grantKey === "team_exports");
+  let aggregate = snapshot.entitlementAggregates[`${subjectKey}:team_exports`];
+  assert.equal(sources.length, 2);
+  assert.equal(sources.find(row => row.sourceKey === `transaction:${oneTimeTransaction}`).status, "active");
+  assert.equal(sources.find(row => row.sourceKey === `subscription:${subscriptionId}`).status, "active");
+  assert.equal(sources.find(row => row.sourceKey === `subscription:${subscriptionId}`).latestTransactionId, recurringTransaction);
+  assert.equal(aggregate.quantity, 2);
+  assert.equal(aggregate.status, "active");
+  assert.equal((await fixture.store.getEntitlement(subjectKey)).active, true);
 
   await deliver(fixture.store, adjustmentEvent({
-    eventNumber: 54,
-    adjustmentNumber: 54,
-    transactionId: firstOneTimeTransaction,
+    eventNumber: 43,
+    adjustmentNumber: 43,
+    transactionId: recurringTransaction,
     eventType: "adjustment.updated",
-    occurredAt: at(base, 14)
+    occurredAt: at(base, 3)
+  }));
+  assert.deepEqual(await fixture.store.processDue(), { applied: 1, ignored: 0, failed: 0 });
+  snapshot = await fixture.store.snapshot();
+  sources = Object.values(snapshot.entitlements).filter(row =>
+    row.subjectKey === subjectKey && row.grantKey === "team_exports");
+  aggregate = snapshot.entitlementAggregates[`${subjectKey}:team_exports`];
+  assert.equal(snapshot.refundedTransactions[recurringTransaction].subscriptionId, subscriptionId);
+  assert.equal(snapshot.refundedTransactions[recurringTransaction].environmentId, environmentId);
+  assert.equal(snapshot.refundedTransactions[recurringTransaction].subjectKey, subjectKey);
+  assert.equal(snapshot.refundedTransactions[recurringTransaction].sourceKey, `subscription:${subscriptionId}`);
+  assert.equal(sources.find(row => row.sourceKey === `transaction:${oneTimeTransaction}`).status, "active");
+  assert.equal(sources.find(row => row.sourceKey === `subscription:${subscriptionId}`).status, "revoked");
+  assert.equal(aggregate.quantity, 1);
+  assert.equal(aggregate.status, "active");
+  assert.equal(snapshot.evidence.includes("immediate-refund"), false);
+  assert.equal((await fixture.store.getEntitlement(subjectKey)).active, true);
+
+  await deliver(fixture.store, subscriptionEvent({
+    eventNumber: 44,
+    subscriptionNumber: 41,
+    eventType: "subscription.canceled",
+    occurredAt: at(base, 4),
+    subjectKey,
+    periodStartsAt: periodStart
+  }));
+  assert.deepEqual(await fixture.store.processDue(), { applied: 1, ignored: 0, failed: 0 });
+  snapshot = await fixture.store.snapshot();
+  aggregate = snapshot.entitlementAggregates[`${subjectKey}:team_exports`];
+  assert.equal(snapshot.subscriptions[subscriptionId].status, "revoked");
+  assert.equal(snapshot.evidence.includes("immediate-refund"), true);
+  assert.equal(aggregate.quantity, 1);
+  assert.equal(aggregate.status, "active");
+  assert.equal((await fixture.store.getEntitlement(subjectKey)).active, true);
+});
+
+test("cancellation then an older approved refund converges terminal state and evidence", async context => {
+  const fixture = await temporaryStore(context);
+  const base = Date.now() - 20_000;
+  const subjectKey = "qa-cancel-then-refund";
+  const periodStart = at(base, 0);
+  const subscriptionId = providerId("sim_sub", 71);
+  const transactionId = providerId("sim_txn", 72);
+
+  await deliver(fixture.store, subscriptionEvent({
+    eventNumber: 70,
+    subscriptionNumber: 71,
+    eventType: "subscription.created",
+    occurredAt: at(base, 0),
+    subjectKey,
+    periodStartsAt: periodStart
+  }));
+  await deliver(fixture.store, transactionEvent({
+    eventNumber: 71,
+    transactionNumber: 72,
+    occurredAt: at(base, 1),
+    subscriptionId,
+    subjectKey,
+    periodStartsAt: periodStart
   }));
   await deliver(fixture.store, subscriptionEvent({
-    eventNumber: 55,
-    subscriptionNumber: 51,
+    eventNumber: 72,
+    subscriptionNumber: 71,
     eventType: "subscription.canceled",
-    occurredAt: at(base, 15),
-    subjectKey: secondBuyer,
-    periodStartsAt: secondPeriod
+    occurredAt: at(base, 3),
+    subjectKey,
+    periodStartsAt: periodStart
   }));
   assert.equal((await fixture.store.processDue()).failed, 0);
-  assert.equal((await fixture.store.getEntitlement(firstBuyer)).active, false);
-  assert.equal((await fixture.store.getEntitlement(secondBuyer)).active, false);
+  let snapshot = await fixture.store.snapshot();
+  assert.equal(snapshot.subscriptions[subscriptionId].status, "revoked");
+  assert.equal(snapshot.evidence.includes("immediate-refund"), false);
+
+  await deliver(fixture.store, adjustmentEvent({
+    eventNumber: 73,
+    adjustmentNumber: 73,
+    transactionId,
+    eventType: "adjustment.updated",
+    occurredAt: at(base, 2)
+  }));
+  assert.deepEqual(await fixture.store.processDue(), { applied: 1, ignored: 0, failed: 0 });
+  snapshot = await fixture.store.snapshot();
+  const source = snapshot.entitlements[`${subjectKey}:team_exports:subscription:${subscriptionId}`];
+  const aggregate = snapshot.entitlementAggregates[`${subjectKey}:team_exports`];
+  assert.equal(snapshot.refundedTransactions[transactionId].subscriptionId, subscriptionId);
+  assert.equal(snapshot.refundedTransactions[transactionId].approvedAt, at(base, 2));
+  assert.equal(source.status, "revoked");
+  assert.equal(source.lastOccurredAt, at(base, 3));
+  assert.equal(aggregate.status, "revoked");
+  assert.equal(aggregate.quantity, 0);
+  assert.equal(snapshot.evidence.includes("immediate-refund"), true);
+  assert.equal((await fixture.store.getEntitlement(subjectKey)).active, false);
+});
+
+test("approved refunds fence the exact transaction and the whole linked subscription", async context => {
+  const fixture = await temporaryStore(context);
+  const base = Date.now() - 20_000;
+  const subjectKey = "qa-refund-fence";
+  const periodStart = at(base, 0);
+  const subscriptionId = providerId("sim_sub", 81);
+  const refundedTransactionId = providerId("sim_txn", 82);
+  const secondTransactionId = providerId("sim_txn", 83);
+
+  await deliver(fixture.store, subscriptionEvent({
+    eventNumber: 80,
+    subscriptionNumber: 81,
+    eventType: "subscription.created",
+    occurredAt: at(base, 0),
+    subjectKey,
+    periodStartsAt: periodStart
+  }));
+  await deliver(fixture.store, transactionEvent({
+    eventNumber: 81,
+    transactionNumber: 82,
+    occurredAt: at(base, 1),
+    subscriptionId,
+    subjectKey,
+    periodStartsAt: periodStart
+  }));
+  await deliver(fixture.store, adjustmentEvent({
+    eventNumber: 82,
+    adjustmentNumber: 82,
+    transactionId: refundedTransactionId,
+    eventType: "adjustment.updated",
+    occurredAt: at(base, 2)
+  }));
+  assert.equal((await fixture.store.processDue()).failed, 0);
+
+  await deliver(fixture.store, transactionEvent({
+    eventNumber: 83,
+    transactionNumber: 82,
+    occurredAt: at(base, 1),
+    subscriptionId,
+    subjectKey,
+    periodStartsAt: periodStart
+  }));
+  await deliver(fixture.store, transactionEvent({
+    eventNumber: 84,
+    transactionNumber: 83,
+    occurredAt: at(base, 2),
+    subscriptionId,
+    subjectKey,
+    periodStartsAt: periodStart
+  }));
+  assert.deepEqual(await fixture.store.processDue(), { applied: 0, ignored: 2, failed: 0 });
+
+  await deliver(fixture.store, transactionEvent({
+    eventNumber: 85,
+    transactionNumber: 82,
+    occurredAt: at(base, 3),
+    subscriptionId,
+    subjectKey,
+    periodStartsAt: periodStart
+  }));
+  await deliver(fixture.store, transactionEvent({
+    eventNumber: 86,
+    transactionNumber: 83,
+    occurredAt: at(base, 3),
+    subscriptionId,
+    subjectKey,
+    periodStartsAt: periodStart
+  }));
+  await deliver(fixture.store, subscriptionEvent({
+    eventNumber: 87,
+    subscriptionNumber: 81,
+    eventType: "subscription.created",
+    occurredAt: at(base, 3),
+    subjectKey,
+    periodStartsAt: periodStart
+  }));
+  assert.deepEqual(await fixture.store.processDue(), { applied: 0, ignored: 0, failed: 3 });
+  const snapshot = await fixture.store.snapshot();
+  assert.equal(snapshot.transactions[secondTransactionId], undefined);
+  assert.equal(snapshot.entitlements[`${subjectKey}:team_exports:subscription:${subscriptionId}`].status, "revoked");
+  assert.equal(snapshot.entitlementAggregates[`${subjectKey}:team_exports`].status, "revoked");
+  assert.equal(snapshot.entitlementAggregates[`${subjectKey}:team_exports`].quantity, 0);
+  assert.equal(snapshot.evidence.includes("immediate-refund"), false);
+  assert.equal((await fixture.store.getEntitlement(subjectKey)).active, false);
+  assert.equal(snapshot.events.find(event => event.providerEventId === eventId(85)).lastErrorCode, "TRANSACTION_ID_COLLISION");
+  for (const number of [86, 87]) assert.equal(
+    snapshot.events.find(event => event.providerEventId === eventId(number)).lastErrorCode,
+    "TERMINAL_REFUND_FENCE"
+  );
+});
+
+test("a stale recurring transaction keeps its immutable projection so a later refund resolves", async context => {
+  const fixture = await temporaryStore(context);
+  const base = Date.now() - 20_000;
+  const subjectKey = "qa-stale-transaction-projection";
+  const periodStart = at(base, 0);
+  const subscriptionId = providerId("sim_sub", 91);
+  const transactionId = providerId("sim_txn", 92);
+
+  await deliver(fixture.store, subscriptionEvent({
+    eventNumber: 90,
+    subscriptionNumber: 91,
+    eventType: "subscription.created",
+    occurredAt: at(base, 2),
+    subjectKey,
+    periodStartsAt: periodStart
+  }));
+  assert.equal((await fixture.store.processDue()).failed, 0);
+  await deliver(fixture.store, transactionEvent({
+    eventNumber: 91,
+    transactionNumber: 92,
+    occurredAt: at(base, 1),
+    subscriptionId,
+    subjectKey,
+    periodStartsAt: periodStart
+  }));
+  assert.deepEqual(await fixture.store.processDue(), { applied: 0, ignored: 1, failed: 0 });
+  let snapshot = await fixture.store.snapshot();
+  assert.equal(snapshot.transactions[transactionId].subscriptionId, subscriptionId);
+  assert.equal(snapshot.transactions[transactionId].occurredAt, at(base, 1));
+  assert.equal(snapshot.entitlements[`${subjectKey}:team_exports:subscription:${subscriptionId}`].latestTransactionId, transactionId);
+
+  await deliver(fixture.store, adjustmentEvent({
+    eventNumber: 92,
+    adjustmentNumber: 92,
+    transactionId,
+    eventType: "adjustment.updated",
+    occurredAt: at(base, 3)
+  }));
+  assert.deepEqual(await fixture.store.processDue(), { applied: 1, ignored: 0, failed: 0 });
+  snapshot = await fixture.store.snapshot();
+  assert.equal(snapshot.refundedTransactions[transactionId].subscriptionId, subscriptionId);
+  assert.equal(snapshot.entitlementAggregates[`${subjectKey}:team_exports`].status, "revoked");
+  assert.equal(snapshot.entitlementAggregates[`${subjectKey}:team_exports`].quantity, 0);
+});
+
+test("a delayed refund and cancellation dominate an already-applied post-approval T2", async context => {
+  const fixture = await temporaryStore(context);
+  const base = Date.now() - 20_000;
+  const subjectKey = "qa-delayed-terminal-convergence";
+  const periodStart = at(base, 0);
+  const subscriptionId = providerId("sim_sub", 101);
+  const firstTransactionId = providerId("sim_txn", 102);
+  const secondTransactionId = providerId("sim_txn", 103);
+
+  await deliver(fixture.store, subscriptionEvent({
+    eventNumber: 100,
+    subscriptionNumber: 101,
+    eventType: "subscription.created",
+    occurredAt: at(base, 0),
+    subjectKey,
+    periodStartsAt: periodStart
+  }));
+  await deliver(fixture.store, transactionEvent({
+    eventNumber: 101,
+    transactionNumber: 102,
+    occurredAt: at(base, 1),
+    subscriptionId,
+    subjectKey,
+    periodStartsAt: periodStart
+  }));
+  assert.equal((await fixture.store.processDue()).failed, 0);
+
+  await deliver(fixture.store, transactionEvent({
+    eventNumber: 102,
+    transactionNumber: 103,
+    occurredAt: at(base, 3),
+    subscriptionId,
+    subjectKey,
+    periodStartsAt: periodStart
+  }));
+  assert.deepEqual(await fixture.store.processDue(), { applied: 1, ignored: 0, failed: 0 });
+  let snapshot = await fixture.store.snapshot();
+  assert.equal(snapshot.transactions[secondTransactionId].subscriptionId, subscriptionId);
+  assert.equal(snapshot.entitlements[`${subjectKey}:team_exports:subscription:${subscriptionId}`].latestTransactionId, secondTransactionId);
+  assert.equal((await fixture.store.getEntitlement(subjectKey)).active, true);
+
+  await deliver(fixture.store, adjustmentEvent({
+    eventNumber: 103,
+    adjustmentNumber: 103,
+    transactionId: firstTransactionId,
+    eventType: "adjustment.updated",
+    occurredAt: at(base, 2)
+  }));
+  assert.deepEqual(await fixture.store.processDue(), { applied: 1, ignored: 0, failed: 0 });
+  snapshot = await fixture.store.snapshot();
+  assert.equal(snapshot.entitlements[`${subjectKey}:team_exports:subscription:${subscriptionId}`].status, "revoked");
+  assert.equal(snapshot.entitlementAggregates[`${subjectKey}:team_exports`].quantity, 0);
+  assert.equal(snapshot.evidence.includes("immediate-refund"), false);
+  assert.equal((await fixture.store.getEntitlement(subjectKey)).active, false);
+
+  await deliver(fixture.store, subscriptionEvent({
+    eventNumber: 104,
+    subscriptionNumber: 101,
+    eventType: "subscription.canceled",
+    occurredAt: new Date(base + 2_500).toISOString(),
+    subjectKey,
+    periodStartsAt: periodStart
+  }));
+  assert.deepEqual(await fixture.store.processDue(), { applied: 1, ignored: 0, failed: 0 });
+  snapshot = await fixture.store.snapshot();
+  assert.equal(snapshot.subscriptions[subscriptionId].status, "revoked");
+  assert.equal(snapshot.evidence.includes("immediate-refund"), true);
+  assert.equal(snapshot.entitlementAggregates[`${subjectKey}:team_exports`].quantity, 0);
+  assert.equal((await fixture.store.getEntitlement(subjectKey)).active, false);
 });
 
 test("subscription identity is symmetric and a terminal source cannot be reactivated", async context => {

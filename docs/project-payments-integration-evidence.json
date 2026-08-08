@@ -1,0 +1,63 @@
+{
+  "schema": "vibenest.net/project-payments/integration-evidence/v1",
+  "status": "READY_FOR_PREVIEW",
+  "preparedOn": "2026-08-08",
+  "scope": "local repository QA only",
+  "target": {
+    "projectId": 532,
+    "repository": "https://github.com/NikitaBabenko/vibenest-pp-e2e-20260808-105508",
+    "branch": "main",
+    "servicePath": "/",
+    "framework": "node-express"
+  },
+  "manifest": {
+    "path": ".vibenest/payments.yaml",
+    "canonicalSha256": "09cf22e3943e666e227bee3541d093fcb5aa6d5c6debb8bf59698ae853a270e3",
+    "products": [
+      { "productKey": "lifetime", "priceKey": "once", "type": "one_time" },
+      { "productKey": "pro", "priceKey": "monthly", "type": "recurring", "interval": "month" }
+    ],
+    "entitlement": "team_exports"
+  },
+  "adapter": {
+    "modes": ["simulator", "paddle", "disabled"],
+    "productionMode": "disabled",
+    "buyerIdentitySource": "request.buyerId from the disposable X-QA-User-Id middleware",
+    "runtimeCatalogSource": "VIBENEST_PROJECT_PAYMENTS_CATALOG_B64",
+    "durableStore": "SQLite inbox and entitlement cache with unique event keys, transactional effects, conditional leases, and expired-lease recovery",
+    "verifierPath": "/.well-known/vibenest/project-payments/verifier",
+    "harnessPath": "/.well-known/vibenest/project-payments/harness"
+  },
+  "localChecks": {
+    "node": { "status": "PASS", "version": "v26.4.0", "declaredMinimum": "22.13", "minimumRuntimeTested": "v22.13.1" },
+    "npmCi": { "status": "PASS", "packagesAdded": 67, "packagesAudited": 68, "vulnerabilities": 0 },
+    "tests": { "status": "PASS", "passed": 21, "failed": 0 },
+    "build": { "status": "PASS" },
+    "npmAudit": { "status": "PASS", "vulnerabilities": 0 },
+    "credentialSecretScan": { "status": "PASS", "scannedFiles": 16, "findings": 0 }
+  },
+  "locallyExercisedProperties": [
+    "untouched raw Buffer HMAC before JSON parsing, with compressed-body rejection",
+    "strict signed simulator event, environment, catalog, and authoritative billing-period validation",
+    "unique runtime-issued product and price IDs mapped only to trusted grants and quantities",
+    "SQLite commit before acknowledgement, event collision detection, conditional leases, and restart recovery",
+    "duplicate convergence and signed-period plus occurrence-time stale-event fencing",
+    "one-time and recurring source isolation through cancellation and refunds in both purchase orders",
+    "renewal advances the signed period exactly once and scheduled cancellation retains its signed end",
+    "server-side buyer isolation for checkout, portal, entitlement, and protected exports",
+    "bounded webhook rate limiting and simulator-only secret-protected evidence harness",
+    "GET-only verifier challenge logic using SOURCE_COMMIT and canonical manifest digest",
+    "disabled mode exposes neither webhook, harness, nor verifier",
+    "seller-owned versioned Draft/noindex legal routes"
+  ],
+  "authoritativeVibeNestVerification": {
+    "status": "PENDING",
+    "requires": [
+      "deployed SOURCE_COMMIT challenge",
+      "control-plane signed lifecycle deliveries",
+      "live harness evidence",
+      "exact-SHA verifier response"
+    ]
+  },
+  "secretMaterialIncluded": false
+}

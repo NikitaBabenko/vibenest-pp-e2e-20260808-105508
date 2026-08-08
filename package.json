@@ -3,10 +3,14 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
     "start": "node src/server.mjs",
-    "build": "node --check src/server.mjs",
-    "test": "node --test"
+    "build": "node --check src/server.mjs && node --check src/project-payments.mjs && node --check src/legal-pages.mjs && node --check src/secret-scan.mjs && node --check scripts/secret-scan.mjs",
+    "test": "node --test",
+    "scan:secrets": "node scripts/secret-scan.mjs"
   },
   "dependencies": {
     "express": "5.1.0"

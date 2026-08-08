@@ -1,0 +1,37 @@
+apiVersion: vibenest.net/project-payments/v1alpha1
+kind: ProjectPayments
+project:
+  key: project-532
+products:
+  - key: lifetime
+    name: Lifetime
+    description: Simulator-only one-time team export access
+    prices:
+      - key: once
+        currency: USD
+        unitAmount: 1500
+        type: one_time
+    grants:
+      - entitlement: team_exports
+        quantity: 1
+  - key: pro
+    name: Pro
+    description: Team export access for active subscribers
+    prices:
+      - key: monthly
+        currency: USD
+        unitAmount: 1500
+        type: recurring
+        interval: month
+    grants:
+      - entitlement: team_exports
+        quantity: 1
+buyer:
+  identity: user_id
+checkout:
+  successPath: /billing/success
+  cancelPath: /pricing
+portal:
+  enabled: true
+refunds:
+  windowDays: 14

@@ -1,0 +1,14 @@
+{
+  "name": "vibenest-project-payments-e2e-20260808",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "build": "node --check src/server.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "express": "5.1.0"
+  }
+}

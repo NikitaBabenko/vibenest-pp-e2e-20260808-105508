@@ -17,6 +17,7 @@ CREATE TABLE project_payment_webhook_event (
     lease_id uuid NULL,
     lease_expires_at timestamptz NULL,
     processed_at timestamptz NULL,
+    processed_instance_id uuid NULL,
     dead_lettered_at timestamptz NULL,
     last_error_code text NULL,
     ignored_as_stale boolean NOT NULL DEFAULT false,
@@ -58,7 +59,11 @@ CREATE INDEX ix_project_payment_entitlement_active
     WHERE status IN ('active', 'scheduled_cancel');
 
 CREATE TABLE project_payment_evidence (
-    name text PRIMARY KEY
+    scope_digest char(64) NOT NULL,
+    name text NOT NULL,
+    source_event_id text NULL,
+    observed_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (scope_digest, name)
 );
 
 CREATE TABLE project_payment_ordering_clock (
@@ -79,3 +84,6 @@ CREATE TABLE project_payment_projection (
 -- corresponding inbox row processed in one transaction. Recurring sources fence first
 -- on the signed billing-period bounds and then on last_occurred_at; terminal events may
 -- revoke immediately but an older event can never reactivate a terminal source.
+-- The internal restart/replay probe uses the same inbox. Its receiving instance cannot
+-- claim it; only a different process instance may process the inert row and insert the
+-- exact-scope (scope_digest, 'restart-replay') evidence record once.

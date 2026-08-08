@@ -47,17 +47,20 @@ header is a disposable simulator ingress shim, not a production authentication d
   pending project-owner legal review rather than being invented.
 
 The simulator-only evidence harness is
-`/.well-known/vibenest/project-payments/harness`. Authenticate every request with
-`X-VibeNest-Simulator-Secret`:
+`POST /.well-known/vibenest/project-payments/harness`. It exists only in the enabled
+simulator verifier runtime, accepts at most 1 KiB of strict JSON, and accepts exactly
+`{ "action": "restart-replay" }`. Every call requires the runtime-only simulator secret
+plus exact `SOURCE_COMMIT` and installed-manifest-digest challenges. The route stages one
+durable inert probe for the SHA-256 scope of environment, manifest, and build. It returns
+exactly `202 { "action": "restart-replay", "state": "staged" }`, or idempotently `200`
+with `state: "already-passed"` after valid evidence already exists.
 
-- `POST` JSON `{ "action": "process" }` drains due durable inbox rows through a fresh store
-  instance.
-- `POST` JSON `{ "action": "restart-replay" }` persists a benign inbox probe and requires a
-  fresh store instance to recover and process it.
-- `POST` JSON `{ "action": "secret-scan" }` scans the deployed project tree and records
-  evidence only when there are zero credential findings.
-- `GET` returns bounded evidence and queue counts; it never returns webhook bodies or
-  secrets.
+The process that receives the POST cannot claim its own probe. Creating another store
+object inside that process does not help because every store shares the process boot ID.
+Only a different Node process sharing the SQLite inbox can process the no-op row and record
+`restart-replay` evidence once. VibeNest owns the real Coolify restart; neither this route
+nor the coding agent receives restart authority. Secret scanning remains repository/CI
+evidence and is never asserted by a runtime HTTP action.
 
 After all lifecycle scenarios pass, VibeNest calls only:
 
@@ -89,7 +92,9 @@ and every verifier secret; those values belong only to the isolated preview runt
 The disposable preview requires Node 22.13 or newer and uses built-in `node:sqlite` with a
 real database under `.data/`. Webhook rows have a unique destination/event key, due and
 lease columns, conditional claims, expired-lease recovery, and transactional effect/cache
-updates. Signed billing-period bounds and event occurrence time are both persisted and fenced;
+updates. The internal restart probe persists both receiving and processing process IDs, is
+ineligible to its receiving boot, and has no buyer, entitlement, transaction, or revenue
+effect. Signed billing-period bounds and event occurrence time are both persisted and fenced;
 renewal must advance exactly one trusted interval. The runtime-issued camelCase catalog is
 read only from `VIBENEST_PROJECT_PAYMENTS_CATALOG_B64` and is rejected unless its provider,
 environment, manifest digest, unique IDs, prices, and grants exactly match the manifest.

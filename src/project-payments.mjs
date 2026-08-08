@@ -9,6 +9,11 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { TextDecoder } from "node:util";
 
+const processBootInstanceId = randomUUID();
+const restartReplayProbeEventType = "internal.restart_replay_probe";
+const verifierCommitPattern = /^[0-9a-f]{40}$/;
+const verifierDigestPattern = /^[0-9a-f]{64}$/;
+
 export const providerModes = Object.freeze({
   simulator: "simulator",
   paddle: "paddle",
@@ -25,10 +30,28 @@ export const requiredLifecycleEvidence = Object.freeze([
   "renewal",
   "scheduled-cancellation",
   "immediate-refund",
-  "customer-portal",
-  "restart-replay",
-  "secret-scan"
+  "customer-portal"
 ]);
+
+export function computeRuntimeEvidenceScope(environmentId, manifestDigest, builtCommit) {
+  if (!idPatterns.environment.test(environmentId ?? "")) {
+    throw new ProjectPaymentError("SIMULATOR_CONFIG_INVALID", "The simulator evidence environment is invalid.");
+  }
+  if (!verifierDigestPattern.test(manifestDigest ?? "")) {
+    throw new ProjectPaymentError("SIMULATOR_CONFIG_INVALID", "The simulator evidence manifest digest is invalid.");
+  }
+  if (!verifierCommitPattern.test(builtCommit ?? "")) {
+    throw new ProjectPaymentError("SIMULATOR_CONFIG_INVALID", "The simulator evidence build commit is invalid.");
+  }
+  return createHash("sha256")
+    .update("vibenest-project-payments-evidence-v1\0", "utf8")
+    .update(environmentId, "utf8")
+    .update("\0", "utf8")
+    .update(manifestDigest, "ascii")
+    .update("\0", "utf8")
+    .update(builtCommit, "ascii")
+    .digest("hex");
+}
 
 export const trustedCatalog = Object.freeze({
   projectKey: "project-532",
@@ -583,7 +606,11 @@ function readTotals(totals) {
 export class DurableProjectPaymentStore {
   constructor(filePath, options = {}) {
     this.filePath = resolve(filePath);
-    this.instanceId = randomUUID();
+    this.instanceId = processBootInstanceId;
+    this.evidenceScope = options.evidenceScope ?? null;
+    if (this.evidenceScope !== null && !verifierDigestPattern.test(this.evidenceScope)) {
+      throw new TypeError("The lifecycle evidence scope must be a SHA-256 digest.");
+    }
     this.clock = options.clock ?? (() => new Date());
     this.leaseMilliseconds = options.leaseMilliseconds ?? 30_000;
     this.maximumAttempts = options.maximumAttempts ?? 5;
@@ -609,6 +636,7 @@ export class DurableProjectPaymentStore {
           lease_id TEXT NULL,
           lease_expires_at TEXT NULL,
           processed_at TEXT NULL,
+          processed_instance_id TEXT NULL,
           dead_lettered_at TEXT NULL,
           last_error_code TEXT NULL,
           ignored_as_stale INTEGER NOT NULL DEFAULT 0,
@@ -651,6 +679,12 @@ export class DurableProjectPaymentStore {
           PRIMARY KEY (namespace, projection_key)
         );
       `);
+      const inboxColumns = new Set(
+        database.prepare("PRAGMA table_info(project_payment_webhook_event)").all().map(column => column.name)
+      );
+      if (!inboxColumns.has("processed_instance_id")) {
+        database.exec("ALTER TABLE project_payment_webhook_event ADD COLUMN processed_instance_id TEXT NULL;");
+      }
     } finally {
       database.close();
     }
@@ -716,6 +750,50 @@ export class DurableProjectPaymentStore {
     return this.#transaction(database => insertEvidence(database, name));
   }
 
+  async stageRestartReplayProbe(destinationKey, now = this.clock()) {
+    if (!idPatterns.environment.test(destinationKey ?? "")) {
+      throw new ProjectPaymentError("RESTART_REPLAY_INVALID", "The restart replay destination is invalid.");
+    }
+    if (!verifierDigestPattern.test(this.evidenceScope ?? "")) {
+      throw new ProjectPaymentError("RESTART_REPLAY_INVALID", "Restart replay requires an exact runtime evidence scope.");
+    }
+    const stagedAt = toIso(now);
+    return this.#transaction(database => {
+      const alreadyPassed = database.prepare(`
+        SELECT 1 FROM project_payment_evidence WHERE name = 'restart-replay'
+      `).get();
+      if (alreadyPassed) return { action: "restart-replay", state: "already-passed" };
+
+      const probeId = stableId("vn_restart_probe", destinationKey, this.evidenceScope);
+      const normalized = {
+        kind: "restart_replay_probe",
+        probeId,
+        environmentId: destinationKey,
+        evidenceScope: this.evidenceScope,
+        orderingKey: `probe:${this.evidenceScope}`
+      };
+      database.prepare(`
+        INSERT OR IGNORE INTO project_payment_webhook_event (
+          destination_key, provider_event_id, event_type, occurred_at, received_at,
+          received_instance_id, body_sha256, normalized_payload, next_attempt_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        destinationKey,
+        probeId,
+        restartReplayProbeEventType,
+        stagedAt,
+        stagedAt,
+        this.instanceId,
+        createHash("sha256")
+          .update(`restart-replay\0${destinationKey}\0${this.evidenceScope}`, "utf8")
+          .digest("hex"),
+        JSON.stringify(normalized),
+        stagedAt
+      );
+      return { action: "restart-replay", state: "staged" };
+    });
+  }
+
   async claimNextDue(now = this.clock()) {
     const nowIso = toIso(now);
     return this.#transaction(database => {
@@ -725,9 +803,10 @@ export class DurableProjectPaymentStore {
           AND dead_lettered_at IS NULL
           AND next_attempt_at <= ?
           AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+          AND (event_type <> ? OR received_instance_id <> ?)
         ORDER BY sequence
         LIMIT 1
-      `).get(nowIso, nowIso);
+      `).get(nowIso, nowIso, restartReplayProbeEventType, this.instanceId);
       if (!due) return null;
       const leaseId = randomUUID();
       const leaseExpiresAt = new Date(Date.parse(nowIso) + this.leaseMilliseconds).toISOString();
@@ -740,7 +819,17 @@ export class DurableProjectPaymentStore {
           AND dead_lettered_at IS NULL
           AND next_attempt_at <= ?
           AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
-      `).run(nowIso, leaseId, leaseExpiresAt, due.sequence, nowIso, nowIso);
+          AND (event_type <> ? OR received_instance_id <> ?)
+      `).run(
+        nowIso,
+        leaseId,
+        leaseExpiresAt,
+        due.sequence,
+        nowIso,
+        nowIso,
+        restartReplayProbeEventType,
+        this.instanceId
+      );
       if (Number(result.changes) !== 1) return null;
       return eventFromRow(database.prepare(`
         SELECT * FROM project_payment_webhook_event WHERE sequence = ?
@@ -762,43 +851,6 @@ export class DurableProjectPaymentStore {
         await this.#failClaimed(claimed, error, now);
       }
     }
-  }
-
-  async verifyRestartReplay() {
-    const probeId = `replay_${randomUUID().replaceAll("-", "")}`;
-    let probeDueAt;
-    await this.#transaction(database => {
-      const now = this.clock().toISOString();
-      // Keep the normal worker from claiming the probe between the durable write and
-      // creation of the fresh store instance used for this explicit recovery check.
-      probeDueAt = new Date(Date.parse(now) + 60_000).toISOString();
-      database.prepare(`
-        INSERT INTO project_payment_webhook_event (
-          destination_key, provider_event_id, event_type, occurred_at, received_at,
-          received_instance_id, body_sha256, normalized_payload, next_attempt_at
-        ) VALUES ('internal', ?, 'internal.replay_probe', ?, ?, ?, ?, ?, ?)
-      `).run(
-        probeId,
-        now,
-        now,
-        this.instanceId,
-        createHash("sha256").update(probeId, "utf8").digest("hex"),
-        JSON.stringify({ kind: "replay_probe", probeId, orderingKey: `probe:${probeId}` }),
-        probeDueAt
-      );
-    });
-    const restarted = new DurableProjectPaymentStore(this.filePath, {
-      clock: this.clock,
-      leaseMilliseconds: this.leaseMilliseconds,
-      maximumAttempts: this.maximumAttempts
-    });
-    await restarted.processDue(new Date(Date.parse(probeDueAt) + 1));
-    const state = await restarted.snapshot();
-    const probe = state.events.find(event => event.providerEventId === probeId);
-    if (!probe?.processedAt || probe.receivedInstanceId === restarted.instanceId) {
-      throw new ProjectPaymentError("RESTART_REPLAY_FAILED", "The durable replay probe was not recovered by a fresh store instance.");
-    }
-    return { passed: state.evidence.includes("restart-replay") };
   }
 
   async getEntitlement(subjectKey, grantKey = trustedCatalog.entitlement, now = this.clock()) {
@@ -855,16 +907,25 @@ export class DurableProjectPaymentStore {
       if (!event || event.processedAt !== null || event.leaseId !== claimed.leaseId) {
         throw new ProjectPaymentError("INBOX_LEASE_LOST", "The inbox event lease is no longer owned.");
       }
+      const restartReplayProbe = event.eventType === restartReplayProbeEventType;
+      if (restartReplayProbe && (
+        event.receivedInstanceId === this.instanceId
+        || event.normalized?.kind !== "restart_replay_probe"
+        || event.normalized?.environmentId !== event.destinationKey
+        || !safeEqualFixedText(event.normalized?.evidenceScope, this.evidenceScope, verifierDigestPattern)
+      )) {
+        throw new ProjectPaymentError("RESTART_REPLAY_INVALID", "The restart replay probe is not bound to a different process and exact runtime scope.");
+      }
       const state = readProjectionState(database);
       const result = applyNormalizedEvent(state, event);
-      if (event.receivedInstanceId !== this.instanceId) addEvidence(state, "restart-replay");
+      if (restartReplayProbe) addEvidence(state, "restart-replay");
       writeProjectionState(database, state);
       const update = database.prepare(`
         UPDATE project_payment_webhook_event
-        SET ignored_as_stale = ?, processed_at = ?, lease_id = NULL,
+        SET ignored_as_stale = ?, processed_at = ?, processed_instance_id = ?, lease_id = NULL,
             lease_expires_at = NULL, last_error_code = NULL
         WHERE sequence = ? AND lease_id = ? AND processed_at IS NULL
-      `).run(result.ignored ? 1 : 0, toIso(now), event.sequence, claimed.leaseId);
+      `).run(result.ignored ? 1 : 0, toIso(now), this.instanceId, event.sequence, claimed.leaseId);
       if (Number(update.changes) !== 1) {
         throw new ProjectPaymentError("INBOX_LEASE_LOST", "The inbox event lease changed before commit.");
       }
@@ -935,6 +996,7 @@ function eventFromRow(row) {
     leaseId: row.lease_id,
     leaseExpiresAt: row.lease_expires_at,
     processedAt: row.processed_at,
+    processedInstanceId: row.processed_instance_id,
     deadLetteredAt: row.dead_lettered_at,
     lastErrorCode: row.last_error_code,
     ignoredAsStale: row.ignored_as_stale === 1,
@@ -1040,12 +1102,20 @@ export async function buildVerifierPayload({
   builtCommit,
   expectedManifestDigest,
   installedManifestDigest,
+  environmentId,
   store
 }) {
   if (provider !== providerModes.simulator || paymentsEnabled !== true || verifierEnabled !== true) return null;
   if (!safeEqualSecret(suppliedSecret, configuredSecret)) return null;
-  if (!/^[0-9a-f]{40}$/.test(builtCommit ?? "") || expectedCommit !== builtCommit) return null;
-  if (!/^[0-9a-f]{64}$/.test(installedManifestDigest ?? "") || expectedManifestDigest !== installedManifestDigest) return null;
+  if (!safeEqualFixedText(expectedCommit, builtCommit, verifierCommitPattern)) return null;
+  if (!safeEqualFixedText(expectedManifestDigest, installedManifestDigest, verifierDigestPattern)) return null;
+  let expectedScope;
+  try {
+    expectedScope = computeRuntimeEvidenceScope(environmentId, installedManifestDigest, builtCommit);
+  } catch {
+    return null;
+  }
+  if (!safeEqualFixedText(store?.evidenceScope, expectedScope, verifierDigestPattern)) return null;
   const status = await store.verificationStatus();
   if (!status.lifecyclePassed || !status.durableInbox || !status.restartReplayPassed) return null;
   return Object.freeze({
@@ -1058,6 +1128,25 @@ export async function buildVerifierPayload({
     durableInbox: true,
     restartReplayPassed: true
   });
+}
+
+export function isSimulatorHarnessAuthorized({
+  provider,
+  paymentsEnabled,
+  verifierEnabled,
+  suppliedSecret,
+  configuredSecret,
+  expectedCommit,
+  builtCommit,
+  expectedManifestDigest,
+  installedManifestDigest
+}) {
+  return provider === providerModes.simulator
+    && paymentsEnabled === true
+    && verifierEnabled === true
+    && safeEqualSecret(suppliedSecret, configuredSecret)
+    && safeEqualFixedText(expectedCommit, builtCommit, verifierCommitPattern)
+    && safeEqualFixedText(expectedManifestDigest, installedManifestDigest, verifierDigestPattern);
 }
 
 export function verifySimulatorSecret(suppliedSecret, configuredSecret) {
@@ -1091,7 +1180,7 @@ export function startInboxWorker(store, options = {}) {
 
 function applyNormalizedEvent(state, event) {
   const normalized = event.normalized;
-  if (normalized.kind === "replay_probe") return { ignored: false };
+  if (normalized.kind === "restart_replay_probe") return { ignored: false };
   if (normalized.providerPriceId) persistCatalogMapping(state, normalized);
   if (normalized.subscriptionId) validateSubscriptionIdentity(state, normalized);
   if (normalized.kind === "transaction_completed") validateTransactionIdentity(state, normalized);
@@ -1422,6 +1511,14 @@ function safeEqualSecret(actual, expected) {
   const actualDigest = createHash("sha256").update(actual, "utf8").digest();
   const expectedDigest = createHash("sha256").update(expected, "utf8").digest();
   return timingSafeEqual(actualDigest, expectedDigest);
+}
+
+function safeEqualFixedText(actual, expected, pattern) {
+  if (typeof actual !== "string" || typeof expected !== "string"
+      || !pattern.test(actual) || !pattern.test(expected)) return false;
+  const actualBytes = Buffer.from(actual, "ascii");
+  const expectedBytes = Buffer.from(expected, "ascii");
+  return actualBytes.length === expectedBytes.length && timingSafeEqual(actualBytes, expectedBytes);
 }
 
 function assertPlainObject(value, label) {

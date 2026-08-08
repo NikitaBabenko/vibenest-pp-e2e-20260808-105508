@@ -1,12 +1,13 @@
 import express from "express";
-import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import {
   acceptSignedEvent,
   buildVerifierPayload,
   computeManifestDigest,
+  computeRuntimeEvidenceScope,
   createProjectPaymentProvider,
   DurableProjectPaymentStore,
+  isSimulatorHarnessAuthorized,
   isSimulatorRuntime,
   oneTimeCatalog,
   ProjectPaymentError,
@@ -14,11 +15,9 @@ import {
   simulatorSessionId,
   startInboxWorker,
   trustedCatalog,
-  validateSimulatorConfiguration,
-  verifySimulatorSecret
+  validateSimulatorConfiguration
 } from "./project-payments.mjs";
 import { sendLegalPage } from "./legal-pages.mjs";
-import { scanProjectTree } from "./secret-scan.mjs";
 
 const verifierPath = "/.well-known/vibenest/project-payments/verifier";
 const harnessPath = "/.well-known/vibenest/project-payments/harness";
@@ -28,17 +27,25 @@ export function createApp(configuration = process.env, options = {}) {
   const app = express();
   const projectRoot = resolve(options.projectRoot ?? process.cwd());
   const simulatorRuntime = isSimulatorRuntime(configuration);
+  const builtCommit = simulatorRuntime ? resolveBuiltCommit(configuration) : null;
+  const evidenceScope = simulatorRuntime
+    ? computeRuntimeEvidenceScope(
+        configuration.VIBENEST_PROJECT_PAYMENTS_ENVIRONMENT_ID,
+        configuration.VIBENEST_PROJECT_PAYMENTS_MANIFEST_DIGEST,
+        builtCommit
+      )
+    : null;
   const storePath = resolveEvidenceScopedStorePath(
     resolve(projectRoot, configuration.PROJECT_PAYMENT_STORE_PATH ?? ".data/project-payments.sqlite"),
     simulatorRuntime
       ? {
           environmentId: configuration.VIBENEST_PROJECT_PAYMENTS_ENVIRONMENT_ID,
           manifestDigest: configuration.VIBENEST_PROJECT_PAYMENTS_MANIFEST_DIGEST,
-          builtCommit: resolveBuiltCommit(configuration)
+          builtCommit
         }
       : null
   );
-  const store = new DurableProjectPaymentStore(storePath);
+  const store = new DurableProjectPaymentStore(storePath, { evidenceScope });
   const provider = createProjectPaymentProvider(configuration);
   const verifierRuntime = simulatorRuntime
     && configuration.VIBENEST_PROJECT_PAYMENTS_VERIFIER_ENABLED === "true";
@@ -52,7 +59,7 @@ export function createApp(configuration = process.env, options = {}) {
       })
     : () => {};
 
-  app.locals.projectPayments = { provider, store, storePath, stopWorker };
+  app.locals.projectPayments = { provider, store, storePath, evidenceScope, stopWorker };
 
   if (configuration.VIBENEST_NOINDEX === "true") {
     app.use((_request, response, next) => {
@@ -89,6 +96,46 @@ export function createApp(configuration = process.env, options = {}) {
           if (error instanceof ProjectPaymentError) return response.sendStatus(400);
           response.sendStatus(500);
         }
+      }
+    );
+  }
+
+  if (verifierRuntime) {
+    app.all(
+      harnessPath,
+      (request, response, next) => {
+        if (request.originalUrl !== harnessPath) return response.sendStatus(404);
+        const authorized = isSimulatorHarnessAuthorized({
+          provider: provider.mode,
+          paymentsEnabled: true,
+          verifierEnabled: true,
+          suppliedSecret: request.get("X-VibeNest-Simulator-Secret"),
+          configuredSecret: configuration.VIBENEST_PROJECT_PAYMENTS_WEBHOOK_SECRET,
+          expectedCommit: request.get("X-VibeNest-Expected-Commit"),
+          builtCommit,
+          expectedManifestDigest: request.get("X-VibeNest-Expected-Manifest-Digest"),
+          installedManifestDigest: configuration.VIBENEST_PROJECT_PAYMENTS_MANIFEST_DIGEST
+        });
+        if (!authorized) return response.sendStatus(404);
+        if (request.method !== "POST") {
+          response.set("Allow", "POST");
+          return response.sendStatus(405);
+        }
+        if (!request.is("application/json")) return response.sendStatus(415);
+        next();
+      },
+      express.json({ limit: "1kb", strict: true, inflate: false }),
+      async (request, response) => {
+        if (!hasOnlyKeys(request.body, ["action"]) || request.body.action !== "restart-replay") {
+          return response.sendStatus(400);
+        }
+        const result = await store.stageRestartReplayProbe(
+          configuration.VIBENEST_PROJECT_PAYMENTS_ENVIRONMENT_ID
+        );
+        response
+          .status(result.state === "already-passed" ? 200 : 202)
+          .set("Cache-Control", "no-store")
+          .json(result);
       }
     );
   }
@@ -210,48 +257,16 @@ export function createApp(configuration = process.env, options = {}) {
         suppliedSecret: request.get("X-VibeNest-Simulator-Secret"),
         configuredSecret,
         expectedCommit: request.get("X-VibeNest-Expected-Commit"),
-        builtCommit: resolveBuiltCommit(configuration),
+        builtCommit,
         expectedManifestDigest: request.get("X-VibeNest-Expected-Manifest-Digest"),
         installedManifestDigest,
+        environmentId: configuration.VIBENEST_PROJECT_PAYMENTS_ENVIRONMENT_ID,
         store
       });
       if (!payload) return response.sendStatus(404);
       response.set("Cache-Control", "no-store").json(payload);
     });
 
-    app.use(async (request, response, next) => {
-      if (request.path !== harnessPath) return next();
-      if (request.method !== "GET" && request.method !== "POST") return response.sendStatus(405);
-      if (!verifySimulatorSecret(
-        request.get("X-VibeNest-Simulator-Secret"),
-        configuration.VIBENEST_PROJECT_PAYMENTS_WEBHOOK_SECRET
-      )) return response.sendStatus(404);
-
-      if (request.method === "GET") {
-        const status = await store.verificationStatus();
-        return response.set("Cache-Control", "no-store").json(status);
-      }
-      if (!hasOnlyKeys(request.body, ["action"]) || typeof request.body.action !== "string") {
-        return response.sendStatus(400);
-      }
-      if (request.body.action === "process") {
-        const restartedStore = new DurableProjectPaymentStore(storePath);
-        const result = await restartedStore.processDue();
-        const status = await restartedStore.verificationStatus();
-        return response.json({ action: "process", ...result, pendingEvents: status.pendingEvents, deadLetteredEvents: status.deadLetteredEvents });
-      }
-      if (request.body.action === "restart-replay") {
-        const result = await store.verifyRestartReplay();
-        return response.json({ action: "restart-replay", ...result });
-      }
-      if (request.body.action === "secret-scan") {
-        const scan = await scanProjectTree(projectRoot);
-        if (!scan.clean) return response.status(422).json({ action: "secret-scan", passed: false, findings: scan.findings.length });
-        await store.recordEvidence("secret-scan");
-        return response.json({ action: "secret-scan", passed: true, scannedFiles: scan.scannedFiles });
-      }
-      response.sendStatus(400);
-    });
   }
 
   app.use((error, _request, response, next) => {
@@ -270,14 +285,7 @@ export function resolveEvidenceScopedStorePath(basePath, runtimeIdentity) {
   const environmentId = runtimeIdentity?.environmentId ?? "";
   const manifestDigest = runtimeIdentity?.manifestDigest ?? "";
   const builtCommit = runtimeIdentity?.builtCommit ?? "";
-  const scope = createHash("sha256")
-    .update("vibenest-project-payments-evidence-v1\0", "utf8")
-    .update(environmentId, "utf8")
-    .update("\0", "utf8")
-    .update(manifestDigest, "ascii")
-    .update("\0", "utf8")
-    .update(builtCommit, "ascii")
-    .digest("hex");
+  const scope = computeRuntimeEvidenceScope(environmentId, manifestDigest, builtCommit);
   return `${resolvedBase}.${scope}`;
 }
 
@@ -322,10 +330,10 @@ function hasOnlyKeys(value, keys) {
 function resolveBuiltCommit(configuration) {
   if (Object.prototype.hasOwnProperty.call(configuration, "SOURCE_COMMIT")) {
     const sourceCommit = configuration.SOURCE_COMMIT?.trim() ?? "";
-    return /^[0-9a-f]{40}$/i.test(sourceCommit) ? sourceCommit.toLowerCase() : "";
+    return /^[0-9a-f]{40}$/.test(sourceCommit) ? sourceCommit : "";
   }
   const legacy = configuration.VIBENEST_BUILD_COMMIT_SHA?.trim();
-  return legacy && /^[0-9a-f]{40}$/i.test(legacy) ? legacy.toLowerCase() : "";
+  return legacy && /^[0-9a-f]{40}$/.test(legacy) ? legacy : "";
 }
 
 function parsePositiveInteger(value, fallback) {

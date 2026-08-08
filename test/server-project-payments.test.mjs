@@ -1,11 +1,21 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import test from "node:test";
 import { gzipSync } from "node:zlib";
-import { computeManifestDigest, requiredLifecycleEvidence, signEvent } from "../src/project-payments.mjs";
+import {
+  computeManifestDigest,
+  DurableProjectPaymentStore,
+  signEvent
+} from "../src/project-payments.mjs";
 import { createApp, resolveEvidenceScopedStorePath } from "../src/server.mjs";
+
+const execFileAsync = promisify(execFile);
+const restartReplayChild = fileURLToPath(new URL("../scripts/restart-replay-child.mjs", import.meta.url));
 
 const secret = `qa-runtime-${"r".repeat(40)}`;
 const environmentId = `sim_env_${"1".repeat(24)}`;
@@ -97,13 +107,13 @@ test("signed subscription state enforces team_exports through scheduled and imme
   const initialPeriodEnd = periodEnd(initialPeriodStart);
   const created = subscriptionEvent(50, 1, "subscription.created", at(base, 0), null, buyer, initialPeriodStart);
   assert.equal((await postWebhook(fixture.url, created)).status, 202);
-  await processHarness(fixture.url);
+  await processInbox(fixture);
   assert.equal((await fetch(`${fixture.url}/api/team-exports`, { headers: buyerHeaders(buyer) })).status, 200);
   assert.equal((await fetch(`${fixture.url}/api/team-exports`, { headers: buyerHeaders("qa-buyer-02") })).status, 403);
 
   const scheduled = subscriptionEvent(51, 1, "subscription.updated", at(base, 2), initialPeriodEnd, buyer, initialPeriodStart);
   await postWebhook(fixture.url, scheduled);
-  await processHarness(fixture.url);
+  await processInbox(fixture);
   const scheduledState = await fetch(`${fixture.url}/api/project-payments/entitlements/team_exports`, { headers: buyerHeaders(buyer) });
   assert.deepEqual(await scheduledState.json(), {
     entitlement: "team_exports",
@@ -114,7 +124,7 @@ test("signed subscription state enforces team_exports through scheduled and imme
 
   const canceled = subscriptionEvent(52, 1, "subscription.canceled", at(base, 4), null, buyer, initialPeriodStart);
   await postWebhook(fixture.url, canceled);
-  await processHarness(fixture.url);
+  await processInbox(fixture);
   assert.equal((await fetch(`${fixture.url}/api/team-exports`, { headers: buyerHeaders(buyer) })).status, 403);
 });
 
@@ -159,20 +169,104 @@ test("webhook rate limiter is bounded and returns 429 without parsing excess pay
   assert.equal((await postWebhook(fixture.url, second)).status, 429);
 });
 
-test("present but blank SOURCE_COMMIT never falls back to the legacy build value", async context => {
-  const fixture = await simulatorServer(context, {
-    SOURCE_COMMIT: "",
-    VIBENEST_BUILD_COMMIT_SHA: commitSha
+test("present but blank SOURCE_COMMIT never falls back to the legacy build value", () => {
+  assert.throws(
+    () => createApp(simulatorConfiguration({
+      SOURCE_COMMIT: "",
+      VIBENEST_BUILD_COMMIT_SHA: commitSha
+    }), { projectRoot: process.cwd(), startWorker: false }),
+    error => error?.code === "SIMULATOR_CONFIG_INVALID"
+  );
+});
+
+test("protected restart harness is strict, process-bound, durable, and idempotent", async context => {
+  const fixture = await simulatorServer(context);
+  const endpoint = `${fixture.url}/.well-known/vibenest/project-payments/harness`;
+  const postRaw = (body, headers = verifierHeaders()) => fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body
   });
-  await postWebhook(fixture.url, transactionEvent(80, 80, new Date().toISOString()));
-  await processHarness(fixture.url);
-  for (const name of requiredLifecycleEvidence) {
-    await fixture.app.locals.projectPayments.store.recordEvidence(name);
-  }
-  const verifier = await fetch(`${fixture.url}/.well-known/vibenest/project-payments/verifier`, {
-    headers: verifierHeaders()
-  });
-  assert.equal(verifier.status, 404);
+
+  assert.equal((await postRaw('{"action":"restart-replay"}', {
+    ...verifierHeaders(),
+    "X-VibeNest-Simulator-Secret": "x".repeat(40)
+  })).status, 404);
+  assert.equal((await postRaw('{"action":"restart-replay"}', {
+    ...verifierHeaders(),
+    "X-VibeNest-Expected-Commit": "b".repeat(40)
+  })).status, 404);
+  assert.equal((await postRaw('{"action":"restart-replay"}', {
+    ...verifierHeaders(),
+    "X-VibeNest-Expected-Manifest-Digest": "c".repeat(64)
+  })).status, 404);
+  assert.equal((await postRaw("{}")).status, 400);
+  assert.equal((await postRaw('{"action":"unsupported"}')).status, 400);
+  assert.equal((await postRaw('{"action":"restart-replay","extra":true}')).status, 400);
+  assert.equal((await postRaw('{"action":')).status, 400);
+  assert.equal((await postRaw(JSON.stringify({
+    action: "restart-replay",
+    padding: "x".repeat(1_100)
+  }))).status, 413);
+  assert.equal((await fetch(endpoint, {
+    method: "POST",
+    headers: { ...verifierHeaders(), "Content-Type": "text/plain" },
+    body: '{"action":"restart-replay"}'
+  })).status, 415);
+  assert.equal((await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      ...verifierHeaders(),
+      "Content-Type": "application/json",
+      "Content-Encoding": "gzip"
+    },
+    body: gzipSync(Buffer.from('{"action":"restart-replay"}', "utf8"))
+  })).status, 415);
+  assert.equal((await fetch(endpoint, { headers: verifierHeaders() })).status, 405);
+  assert.equal((await fetch(`${endpoint}?unexpected=1`, {
+    method: "POST",
+    headers: { ...verifierHeaders(), "Content-Type": "application/json" },
+    body: '{"action":"restart-replay"}'
+  })).status, 404);
+
+  const staged = await postRaw('{"action":"restart-replay"}');
+  assert.equal(staged.status, 202);
+  assert.equal(staged.headers.get("content-type"), "application/json; charset=utf-8");
+  assert.deepEqual(await staged.json(), { action: "restart-replay", state: "staged" });
+  const stagedRetry = await postRaw('{"action":"restart-replay"}');
+  assert.equal(stagedRetry.status, 202);
+  assert.deepEqual(await stagedRetry.json(), { action: "restart-replay", state: "staged" });
+
+  const sameBootStore = new DurableProjectPaymentStore(
+    fixture.app.locals.projectPayments.storePath,
+    { evidenceScope: fixture.app.locals.projectPayments.evidenceScope }
+  );
+  assert.deepEqual(await sameBootStore.processDue(), { applied: 0, ignored: 0, failed: 0 });
+  const pendingProbe = (await sameBootStore.snapshot()).events.find(
+    event => event.eventType === "internal.restart_replay_probe"
+  );
+  assert.ok(pendingProbe);
+  assert.equal(pendingProbe.processedAt, null);
+
+  const firstChild = await runRestartReplayChild(fixture);
+  assert.deepEqual(firstChild.result, { applied: 1, ignored: 0, failed: 0 });
+  assert.equal(firstChild.status.restartReplayPassed, true);
+  const secondChild = await runRestartReplayChild(fixture);
+  assert.deepEqual(secondChild.result, { applied: 0, ignored: 0, failed: 0 });
+
+  const snapshot = await sameBootStore.snapshot();
+  const processedProbe = snapshot.events.find(event => event.eventType === "internal.restart_replay_probe");
+  assert.ok(processedProbe.processedAt);
+  assert.notEqual(processedProbe.processedInstanceId, processedProbe.receivedInstanceId);
+  assert.equal(snapshot.evidence.filter(name => name === "restart-replay").length, 1);
+  assert.deepEqual(snapshot.entitlements, {});
+  assert.deepEqual(snapshot.transactions, {});
+  assert.deepEqual(snapshot.subscriptions, {});
+  assert.deepEqual(snapshot.refundedTransactions, {});
+
+  const completedRetry = await postRaw('{"action":"restart-replay"}');
+  assert.equal(completedRetry.status, 200);
+  assert.deepEqual(await completedRetry.json(), { action: "restart-replay", state: "already-passed" });
 });
 
 test("simulator harness derives the complete lifecycle and GET-only verifier returns the exact contract", async context => {
@@ -207,28 +301,25 @@ test("simulator harness derives the complete lifecycle and GET-only verifier ret
   for (const event of lifecycle) assert.equal((await postWebhook(fixture.url, event)).status, 202);
   assert.equal((await postWebhook(fixture.url, oneTime)).status, 202);
 
-  const processed = await processHarness(fixture.url);
-  assert.equal(processed.status, 200);
-  const processResult = await processed.json();
+  const processResult = await processInbox(fixture);
   assert.equal(processResult.failed, 0);
-  assert.equal(processResult.pendingEvents, 0);
-  assert.equal(processResult.deadLetteredEvents, 0);
+  const beforeRestart = await fixture.app.locals.projectPayments.store.verificationStatus();
+  assert.equal(beforeRestart.pendingEvents, 0);
+  assert.equal(beforeRestart.deadLetteredEvents, 0);
 
-  const replay = await postHarness(fixture.url, "restart-replay");
-  assert.deepEqual(await replay.json(), { action: "restart-replay", passed: true });
-  const scan = await postHarness(fixture.url, "secret-scan");
-  assert.equal(scan.status, 200);
-  assert.equal((await scan.json()).passed, true);
-
-  assert.equal((await fetch(`${fixture.url}/.well-known/vibenest/project-payments/harness`)).status, 404);
-  const statusResponse = await fetch(`${fixture.url}/.well-known/vibenest/project-payments/harness`, {
-    headers: simulatorHeaders()
+  const staged = await postRestartHarness(fixture.url);
+  assert.equal(staged.status, 202);
+  assert.deepEqual(await staged.json(), { action: "restart-replay", state: "staged" });
+  assert.deepEqual(await fixture.app.locals.projectPayments.store.processDue(), {
+    applied: 0, ignored: 0, failed: 0
   });
-  const status = await statusResponse.json();
-  assert.deepEqual(status.evidence, [...requiredLifecycleEvidence].sort());
-  assert.equal(status.lifecyclePassed, true);
-  assert.equal(status.durableInbox, true);
-  assert.equal(status.restartReplayPassed, true);
+  const child = await runRestartReplayChild(fixture);
+  assert.deepEqual(child.result, { applied: 1, ignored: 0, failed: 0 });
+  assert.equal(child.status.restartReplayPassed, true);
+
+  const alreadyPassed = await postRestartHarness(fixture.url);
+  assert.equal(alreadyPassed.status, 200);
+  assert.deepEqual(await alreadyPassed.json(), { action: "restart-replay", state: "already-passed" });
 
   const verifierUrl = `${fixture.url}/.well-known/vibenest/project-payments/verifier`;
   assert.equal((await fetch(verifierUrl)).status, 404);
@@ -267,19 +358,10 @@ test("seller-owned legal routes use the versioned Draft/noindex templates", asyn
 
 async function simulatorServer(context, overrides = {}) {
   const directory = await mkdtemp(join(tmpdir(), "vn-pp-http-"));
-  const configuration = {
-    VIBENEST_PROJECT_PAYMENTS_ENABLED: "true",
-    VIBENEST_PROJECT_PAYMENTS_PROVIDER: "simulator",
-    VIBENEST_PROJECT_PAYMENTS_VERIFIER_ENABLED: "true",
-    VIBENEST_PROJECT_PAYMENTS_WEBHOOK_SECRET: secret,
-    VIBENEST_PROJECT_PAYMENTS_ENVIRONMENT_ID: environmentId,
-    VIBENEST_PROJECT_PAYMENTS_MANIFEST_DIGEST: computeManifestDigest(),
-    VIBENEST_PROJECT_PAYMENTS_CATALOG_B64: runtimeCatalogB64(),
-    SOURCE_COMMIT: commitSha,
-    VIBENEST_NOINDEX: "true",
+  const configuration = simulatorConfiguration({
     PROJECT_PAYMENT_STORE_PATH: join(directory, "store.sqlite"),
     ...overrides
-  };
+  });
   const app = createApp(configuration, { projectRoot: process.cwd(), startWorker: false });
   const server = app.listen(0);
   await new Promise(resolve => server.once("listening", resolve));
@@ -290,6 +372,21 @@ async function simulatorServer(context, overrides = {}) {
     await rm(directory, { recursive: true, force: true });
   });
   return { app, configuration, url: `http://127.0.0.1:${address.port}` };
+}
+
+function simulatorConfiguration(overrides = {}) {
+  return {
+    VIBENEST_PROJECT_PAYMENTS_ENABLED: "true",
+    VIBENEST_PROJECT_PAYMENTS_PROVIDER: "simulator",
+    VIBENEST_PROJECT_PAYMENTS_VERIFIER_ENABLED: "true",
+    VIBENEST_PROJECT_PAYMENTS_WEBHOOK_SECRET: secret,
+    VIBENEST_PROJECT_PAYMENTS_ENVIRONMENT_ID: environmentId,
+    VIBENEST_PROJECT_PAYMENTS_MANIFEST_DIGEST: computeManifestDigest(),
+    VIBENEST_PROJECT_PAYMENTS_CATALOG_B64: runtimeCatalogB64(),
+    SOURCE_COMMIT: commitSha,
+    VIBENEST_NOINDEX: "true",
+    ...overrides
+  };
 }
 
 async function postWebhook(baseUrl, payload) {
@@ -305,12 +402,29 @@ async function postWebhook(baseUrl, payload) {
   });
 }
 
-function processHarness(baseUrl) {
-  return postHarness(baseUrl, "process");
+function processInbox(fixture) {
+  return fixture.app.locals.projectPayments.store.processDue();
 }
 
-function postHarness(baseUrl, action) {
-  return postJson(`${baseUrl}/.well-known/vibenest/project-payments/harness`, { action }, simulatorHeaders());
+function postRestartHarness(baseUrl) {
+  return postJson(
+    `${baseUrl}/.well-known/vibenest/project-payments/harness`,
+    { action: "restart-replay" },
+    verifierHeaders()
+  );
+}
+
+async function runRestartReplayChild(fixture) {
+  const { stdout } = await execFileAsync(process.execPath, [
+    restartReplayChild,
+    fixture.app.locals.projectPayments.storePath,
+    fixture.app.locals.projectPayments.evidenceScope
+  ], {
+    encoding: "utf8",
+    timeout: 10_000,
+    windowsHide: true
+  });
+  return JSON.parse(stdout);
 }
 
 function postJson(url, body, headers = {}) {

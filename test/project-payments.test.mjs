@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import {
@@ -9,6 +12,7 @@ import {
   buildVerifierPayload,
   canonicalManifest,
   computeManifestDigest,
+  computeRuntimeEvidenceScope,
   createProjectPaymentProvider,
   DurableProjectPaymentStore,
   oneTimeCatalog,
@@ -25,12 +29,16 @@ import {
 import { scanProjectTree } from "../src/secret-scan.mjs";
 
 const simulatorSecret = `qa-simulator-${"s".repeat(40)}`;
+const execFileAsync = promisify(execFile);
+const restartReplayChild = fileURLToPath(new URL("../scripts/restart-replay-child.mjs", import.meta.url));
 const environmentId = `sim_env_${"e".repeat(24)}`;
 const productId = `sim_prod_${"d".repeat(24)}`;
 const priceId = `sim_price_${"c".repeat(24)}`;
 const oneTimeProductId = `sim_prod_${"b".repeat(24)}`;
 const oneTimePriceId = `sim_price_${"a".repeat(24)}`;
 const buyer = "qa-buyer-01";
+const commitSha = "a".repeat(40);
+const evidenceScope = computeRuntimeEvidenceScope(environmentId, computeManifestDigest(), commitSha);
 const runtimeCatalog = parseRuntimeCatalog(runtimeCatalogB64(), environmentId, computeManifestDigest());
 
 test("manifest projection is provider-neutral and matches the recurring and one-time catalog", async () => {
@@ -176,7 +184,7 @@ test("durable inbox deduplicates, fences stale state, and recovers expired lease
   assert.deepEqual(await restarted.processDue(new Date(base + 1_020)), { applied: 1, ignored: 0, failed: 0 });
   let state = await restarted.snapshot();
   assert.ok(state.evidence.includes("duplicate-delivery"));
-  assert.ok(state.evidence.includes("restart-replay"));
+  assert.equal(state.evidence.includes("restart-replay"), false);
   assert.equal((await restarted.getEntitlement(buyer, trustedCatalog.entitlement, new Date(base + 2_000))).active, true);
 
   const newerCancel = subscriptionEvent({ eventNumber: 12, subscriptionNumber: 1, eventType: "subscription.canceled", occurredAt: new Date(base + 4_000).toISOString(), periodStartsAt: periodStart });
@@ -404,7 +412,13 @@ test("verifier is secret-, challenge-, lifecycle-, and durable-inbox-gated", asy
   await deliver(fixture.store, transactionEvent({ eventNumber: 40, transactionNumber: 8, occurredAt: new Date().toISOString() }));
   await fixture.store.processDue();
   for (const name of requiredLifecycleEvidence) await fixture.store.recordEvidence(name);
-  const commitSha = "a".repeat(40);
+  assert.deepEqual(
+    await fixture.store.stageRestartReplayProbe(environmentId),
+    { action: "restart-replay", state: "staged" }
+  );
+  assert.deepEqual(await fixture.store.processDue(), { applied: 0, ignored: 0, failed: 0 });
+  const child = await runRestartReplayChild(fixture.file);
+  assert.deepEqual(child.result, { applied: 1, ignored: 0, failed: 0 });
   const manifestDigest = computeManifestDigest();
   const input = {
     provider: providerModes.simulator,
@@ -416,6 +430,7 @@ test("verifier is secret-, challenge-, lifecycle-, and durable-inbox-gated", asy
     builtCommit: commitSha,
     expectedManifestDigest: manifestDigest,
     installedManifestDigest: manifestDigest,
+    environmentId,
     store: fixture.store
   };
   assert.deepEqual(await buildVerifierPayload(input), {
@@ -572,7 +587,24 @@ async function temporaryStore(context) {
   const directory = await mkdtemp(join(tmpdir(), "vn-pp-test-"));
   context.after(() => rm(directory, { recursive: true, force: true }));
   const file = join(directory, "store.sqlite");
-  return { directory, file, store: new DurableProjectPaymentStore(file) };
+  return {
+    directory,
+    file,
+    store: new DurableProjectPaymentStore(file, { evidenceScope })
+  };
+}
+
+async function runRestartReplayChild(storePath) {
+  const { stdout } = await execFileAsync(process.execPath, [
+    restartReplayChild,
+    storePath,
+    evidenceScope
+  ], {
+    encoding: "utf8",
+    timeout: 10_000,
+    windowsHide: true
+  });
+  return JSON.parse(stdout);
 }
 
 function at(base, seconds) {

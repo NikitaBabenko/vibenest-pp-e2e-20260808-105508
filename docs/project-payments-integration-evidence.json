@@ -24,17 +24,17 @@
     "productionMode": "disabled",
     "buyerIdentitySource": "request.buyerId from the disposable X-QA-User-Id middleware",
     "runtimeCatalogSource": "VIBENEST_PROJECT_PAYMENTS_CATALOG_B64",
-    "durableStore": "SQLite inbox and entitlement cache with unique event keys, transactional effects, conditional leases, and expired-lease recovery",
+    "durableStore": "SQLite inbox and entitlement cache with unique event keys, transactional effects, conditional leases, expired-lease recovery, and process-bound restart probes",
     "verifierPath": "/.well-known/vibenest/project-payments/verifier",
     "harnessPath": "/.well-known/vibenest/project-payments/harness"
   },
   "localChecks": {
     "node": { "status": "PASS", "version": "v26.4.0", "declaredMinimum": "22.13", "minimumRuntimeTested": "v22.13.1" },
     "npmCi": { "status": "PASS", "packagesAdded": 67, "packagesAudited": 68, "vulnerabilities": 0 },
-    "tests": { "status": "PASS", "passed": 23, "failed": 0 },
+    "tests": { "status": "PASS", "passed": 24, "failed": 0 },
     "build": { "status": "PASS" },
     "npmAudit": { "status": "PASS", "vulnerabilities": 0 },
-    "credentialSecretScan": { "status": "PASS", "scannedFiles": 16, "findings": 0 }
+    "credentialSecretScan": { "status": "PASS", "scannedFiles": 17, "findings": 0 }
   },
   "locallyExercisedProperties": [
     "untouched raw Buffer HMAC before JSON parsing, with compressed-body rejection",
@@ -46,8 +46,10 @@
     "renewal advances the signed period exactly once and scheduled cancellation retains its signed end",
     "server-side buyer isolation for checkout, portal, entitlement, and protected exports",
     "symmetric subscription identity fencing and terminal no-reactivation after cancellation",
-    "bounded webhook rate limiting and simulator-only secret-protected evidence harness",
-    "GET-only verifier challenge logic with durable evidence partitioned by environment, canonical manifest digest, and exact SOURCE_COMMIT",
+    "bounded webhook rate limiting and simulator-only strict 1 KiB POST harness with constant-time secret and exact commit/digest challenges",
+    "durable inert restart probe scoped by environment, canonical manifest digest, and exact SOURCE_COMMIT",
+    "a fresh store in the receiving boot cannot claim the probe; a separate Node subprocess sharing SQLite processes it exactly once and persists a different processing instance ID",
+    "GET-only verifier challenge logic rejects incomplete lifecycle or pre-restart evidence and returns only the exact bounded contract",
     "disabled mode exposes neither webhook, harness, nor verifier",
     "seller-owned versioned Draft/noindex legal routes"
   ],
@@ -56,7 +58,7 @@
     "requires": [
       "deployed SOURCE_COMMIT challenge",
       "control-plane signed lifecycle deliveries",
-      "live harness evidence",
+      "platform-owned real Coolify process restart and post-restart probe replay",
       "exact-SHA verifier response"
     ]
   },
